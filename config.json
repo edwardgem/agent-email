@@ -12,18 +12,6 @@
   "RECIPIENTS": [
     "edward.cheng@oracle.com"
   ],
-  "llm": {
-    "provider": "ollama",
-    "model": "gpt-oss:20b",
-    "endpoint": "http://127.0.0.1:11434",
-    "options": {
-      "temperature": 0.3,
-      "top_k": 40,
-      "top_p": 0.9,
-      "repeat_penalty": 1.1,
-      "num_ctx": 4096
-    }
-  },
   "email": {
     "transport": "gmail-api"
   }

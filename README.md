@@ -101,8 +101,8 @@ curl -X POST http://localhost:3000/api/email/generate-send \
 - `POST /api/email/generate-send` — generate and send in one call
 
 ## Port Configuration
-- The default port is 3000. You can override it by setting the `PORT` environment variable:
-  - `PORT=3001 bash run.sh`
+- The default port is 3001. You can override it by setting the `PORT` environment variable:
+  - `PORT=3005 bash run.sh`
 
 ## Legacy
 - The legacy shell script is kept for reference but is not required for REST operation.

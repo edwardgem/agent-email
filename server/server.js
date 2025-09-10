@@ -1,3 +1,4 @@
+require('dotenv').config();
 // Helper to load a config.json file
 function loadConfig(configPath) {
   try {
@@ -48,7 +49,7 @@ const fs = require('fs');
 const path = require('path');
 const { generateHtml } = require('./llm');
 const { sendEmail } = require('./gmail');
-const { agent_log } = require('./logger');
+const { agent_log, appendLogLocal } = require('./logger');
 
 const REPO_ROOT = path.resolve(__dirname, '..');
 const DEFAULT_CONFIG_PATH = path.join(REPO_ROOT, 'config.json');
@@ -166,7 +167,7 @@ async function handleGenerate(req, res, body) {
       // Log agent state - active
       agent_log({ message: 'state - active', config: normalizeConfig(base), runLogOverride: paths.runLog });
       // Log instance folder path
-      agent_log({ message: `instance folder: ${paths.root}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
+      appendLogLocal(`instance folder: ${paths.root}`);
       // Error check: instance_id in config must match last part of instancePath
       if (base.instance_id) {
         const lastPart = require('path').basename(paths.root);
@@ -231,11 +232,14 @@ async function handleGenerate(req, res, body) {
       enhancedPrompt = `${promptWithKeys}\n\nIMPORTANT: Your response must contain ONLY the HTML email content wrapped in \`\`\`html code blocks.`;
     }
 
-    const llmCfg = base.llm || {};
-    const provider = body.provider || llmCfg.provider || 'ollama';
-    const model = body.model || llmCfg.model || 'llama3.1';
-    const endpoint = body.endpoint || llmCfg.endpoint || 'http://127.0.0.1:11434';
-    const options = body.options || llmCfg.options || {};
+    const provider = body.provider || process.env.LLM_PROVIDER || 'ollama';
+    const model = body.model || process.env.LLM_MODEL || 'llama3.1';
+    const endpoint = body.endpoint || process.env.LLM_ENDPOINT || 'http://127.0.0.1:11434';
+    let options = body.options;
+    if (!options && process.env.LLM_OPTIONS) {
+      try { options = JSON.parse(process.env.LLM_OPTIONS); } catch (e) { options = {}; }
+    }
+    options = options || {};
 
     // Log the effective prompt and LLM config for debugging adherence
     appendLog([
@@ -258,7 +262,24 @@ async function handleGenerate(req, res, body) {
   console.log('[DEBUG] htmlOutput (API response):', htmlOutput);
   console.log('[DEBUG] outputPath (actual file write):', outputPath);
   fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+  // If email.html exists, move it to email-1.html, email-2.html, etc.
+  if (fs.existsSync(outputPath)) {
+    const dir = path.dirname(outputPath);
+    const base = path.basename(outputPath, '.html');
+    let n = 1;
+    let candidate;
+    do {
+      candidate = path.join(dir, `${base}-${n}.html`);
+      n++;
+    } while (fs.existsSync(candidate));
+    fs.renameSync(outputPath, candidate);
+    appendLog(`[INFO] Archived existing email.html to ${path.basename(candidate)}`);
+  }
+  // Log before writing new HTML
+  appendLogLocal(`[PROGRESS] Generating HTML file: ${outputPath}`);
+  appendLogLocal(`[CONTENT] HTML file content:\n${html}`);
   fs.writeFileSync(outputPath, html, 'utf8');
+  appendLogLocal(`[PROGRESS] Finished writing HTML file: ${outputPath}`);
   res.writeHead(200, { 'content-type': 'application/json' });
   res.end(JSON.stringify({ htmlPath: htmlOutput, html }));
   } catch (e) {
@@ -316,6 +337,7 @@ async function handleSend(req, res, body) {
     const fromName = body.senderName || base.SENDER_NAME;
     const recipients = Array.isArray(body.recipients) ? body.recipients : (base.RECIPIENTS || []);
 
+  appendLogLocal(`[PROGRESS] Sending email to recipients: ${recipients && recipients.length ? recipients.join(', ') : 'none'}`);
     const data = await sendEmail({
       fromName,
       fromEmail,

@@ -1,54 +1,55 @@
 // logger.js
 // Agent logging utility for agent-email project
 
+
+
+const fetch = require('node-fetch');
 const fs = require('fs');
 const path = require('path');
-const { promisify } = require('util');
-const lockfile = require('proper-lockfile');
 
-// Helper to get formatted date for amp log filename (e.g., amp-sep-2025.log)
-function getAmpLogFilename() {
-  const now = new Date();
-  const month = now.toLocaleString('en-US', { month: 'short' }).toLowerCase();
-  const year = now.getFullYear();
-  return `amp-${month}-${year}.log`;
-}
+const LOG_API_URL = process.env.LOG_API_URL || 'http://localhost:4000/api/log';
 
-// Helper to get timestamp string in required format
-function getAgentTimestamp() {
-  return new Date().toString().replace(/ GMT.*$/, ''); // e.g. Mon Sep 1 09:30:00 PDT 2025
-}
 
-// Main agent_log function
-async function agent_log({ message, config }) {
-  if (!message || !config) return;
-  const instanceId = config.instance_id || 'unknown-instance';
-  const ampLoggerPath = config.amp_logger || 'logs';
-  const repoRoot = path.resolve(__dirname, '..');
-  const ampLogDir = path.isAbsolute(ampLoggerPath) ? ampLoggerPath : path.join(repoRoot, ampLoggerPath);
-  const ampLogFile = path.join(ampLogDir, getAmpLogFilename());
-  // Allow override of run.log location (for per-instance logs)
-  const runLogFile = arguments[0].runLogOverride || path.join(repoRoot, 'logs', 'run.log');
 
-  const logLine = `${getAgentTimestamp()}: [${instanceId}] ${message}`;
-
-  // Ensure amp log dir exists
-  fs.mkdirSync(ampLogDir, { recursive: true });
-
-  // Write to run.log (no lock)
-  fs.appendFileSync(runLogFile, logLine + '\n');
-
-  // Write to amp log with file lock
-  let release;
+// Helper to append log to local run.log
+function appendLogLocal(message, runLogOverride) {
   try {
-    release = await lockfile.lock(ampLogFile, { retries: 3, stale: 5000 });
-    fs.appendFileSync(ampLogFile, logLine + '\n');
+    const stamp = new Date().toISOString();
+    const logLine = `[${stamp}] ${message}\n`;
+    // If runLogOverride is provided (per-instance), use it; else use project logs/run.log
+    const logPath = runLogOverride || path.resolve(__dirname, '../logs/run.log');
+    fs.mkdirSync(path.dirname(logPath), { recursive: true });
+    fs.appendFileSync(logPath, logLine);
   } catch (e) {
-    // If lock fails, fallback: still try to write (may race)
-    fs.appendFileSync(ampLogFile, logLine + '\n');
-  } finally {
-    if (release) await release();
+    // Fallback: print to console if file write fails
+    console.error('[agent_log local] Failed to write log:', e);
   }
 }
 
-module.exports = { agent_log };
+// Main agent_log function: log to REST API and local run.log
+async function agent_log({ message, config, level = 'info', meta = {}, service = 'agent-email', runLogOverride }) {
+  if (!message || !config) return;
+  const instanceId = config.instance_id || 'unknown-instance';
+  // Always log locally
+  appendLogLocal(message, runLogOverride);
+  // Also send to REST API
+  try {
+    await fetch(LOG_API_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        service,
+        level,
+        message,
+        timestamp: new Date().toISOString(),
+        meta: { ...meta, instance_id: instanceId }
+      })
+    });
+  } catch (e) {
+    // Log REST errors locally as well
+    appendLogLocal(`[agent_log REST] Failed to log: ${e}`, runLogOverride);
+    console.error('[agent_log REST] Failed to log:', e);
+  }
+}
+
+module.exports = { agent_log, appendLogLocal };

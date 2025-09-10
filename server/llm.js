@@ -46,7 +46,9 @@ function httpJson({ method = 'POST', endpoint, path: p, headers = {}, body }) {
   });
 }
 
-async function generateWithOllama({ endpoint = 'http://127.0.0.1:11434', model = 'llama3.1', prompt, options = {} }) {
+async function generateWithOllama({ endpoint, model, prompt, options = {} }) {
+  endpoint = endpoint || process.env.LLM_ENDPOINT || 'http://127.0.0.1:11434';
+  model = model || process.env.LLM_MODEL || 'llama3.1';
   // Use non-streaming generate API for simplicity
   const resp = await httpJson({
     endpoint,
@@ -63,7 +65,9 @@ async function generateWithOllama({ endpoint = 'http://127.0.0.1:11434', model =
   return { text, html };
 }
 
-async function generateWithOpenAI({ apiKey = process.env.OPENAI_API_KEY, model = 'gpt-4o-mini', prompt, options = {} }) {
+async function generateWithOpenAI({ apiKey, model, prompt, options = {} }) {
+  apiKey = apiKey || process.env.OPENAI_API_KEY;
+  model = model || process.env.LLM_MODEL || 'gpt-4o-mini';
   if (!apiKey) throw new Error('Missing OPENAI_API_KEY for OpenAI provider');
   // Map generic options into OpenAI fields when available
   const temperature = options.temperature ?? 0.3;
@@ -91,6 +95,7 @@ async function generateWithOpenAI({ apiKey = process.env.OPENAI_API_KEY, model =
 }
 
 async function generateHtml({ provider, model, endpoint, prompt, options }) {
+  provider = provider || process.env.LLM_PROVIDER || 'ollama';
   if (provider === 'openai') {
     return generateWithOpenAI({ model, prompt, options });
   }
