@@ -1,0 +1,57 @@
+[ROLE] Act as Inquiryon's staff
+
+[OBJECTIVE] Write an HTML email to invite recipients to the event.
+
+[CONTEXT]
+•⁠  It is an invitation to a brownbag event hosted by Inquiryon, Inc.
+•⁠  It is AI oriented discussion.
+•⁠  Attendees are technical savy, including engineers, managers, and users.
+
+[CONSTRAINTS]
+•⁠  Output format: HTML to display in email.
+•⁠  Design: Use graphics, icons to associate with AI, but prefer a clean and simple design.
+•⁠  Length: To the point.
+•⁠  Tone/language: professional, engaging, and informative.
+•⁠  Criteria: Call for action to RSVP, provide event details, and encourage discussion.
+
+[EVENT DETAILS]
+•⁠  Event Type: Online Brownbag event.
+•⁠  Title: Safe AI Agents with Human-in-the-Loop.
+.  Speaker: Jeshua Cheng, Founder of Inquiryon.
+•⁠  Date: August 22 (Fri)
+•⁠  Time: 11am-12noon
+.  Venue: Google meet, https://meet.google.com/nuk-nbbo-ptn
+.  Sender: Edward Cheng, InquiryOn
+
+[Icons and images]
+•⁠  Do not invent image URLs.
+•⁠  For paragraph/section icons, use emojis (🤖, 💡, 🔒) instead of <img>.
+•⁠  The only allowed <img> is the logo at https://inquiryon.com/logo.png.
+•⁠  If you encounter any <img> for icons, replace them with emojis and remove the <img>.
+
+[CONTENT]
+1) Put the logo on top.
+   - Inquiryon's logo should be included, https://inquiryon.com/logo.png. The word Inquiryon of matching size should be next to the logo.
+   - The background of the logo section should be gradient from grey (60%) to black (100%).
+   - The logo should be centered.
+2) Show the Title of the event.
+3) A section to show the date/time/speaker/venue of the event. And ask people to join us.
+4) A section on Critical Challenge with three bullets.
+   - AI agents are quickly rising with strong capabilities to take actions, etc.
+   - But <b>67% of CEO's top concern</b> of risk is AI agent making mistakes.
+5) A section on what we will discuss in bullets:
+   - the powerful capabilities of AI agents.
+   - MCP and agent tools integration.
+   - Our innovative solution: Human-in-the-Loop (HITL) for Safe AI agents.
+   - Demo.
+6) Call for action.
+   - invite people to join the discussion.
+   - A button to Join Google Meet.
+   - Ask recipients to reply if they plan to attend and feel free to forward it to whoever will be interested.
+
+[TASKS]
+1) Create the Email in HTML format for review.
+   - Come up with a design and Use engaging graphics and icons related to AI. Use round corners for the content box.
+   - Use the provided event details.
+   - Ensure the tone is professional, engaging, and informative.
+2) Review the HTML email to ensure compatibility for both browser and email client.

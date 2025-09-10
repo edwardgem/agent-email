@@ -1,0 +1,8 @@
+{
+  "EMAIL_SUBJECT": "Inquiryon Lab: AI Agents with Human-in-the-Loop - Brown Bag Session (8/22)",
+  "SENDER_EMAIL": "edwardgem@gmail.com",
+  "SENDER_NAME": "Edward Cheng, Inquiryon",
+  "HTML_OUTPUT": "outputs/inquiryon_lab_invitation.html",
+  "PROMPT_FILE": "prompt.txt",
+  "RECIPIENTS": []
+}

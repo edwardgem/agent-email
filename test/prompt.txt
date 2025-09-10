@@ -1,0 +1,15 @@
+[ROLE] Act as Inquiryon's staff
+
+[OBJECTIVE] Write an HTML email invitation for a short brownbag session.
+
+[EVENT]
+• Title: AI Agents with Human-in-the-Loop (HITL)
+• Date: Aug 22 (Fri)
+• Time: 11am–12noon
+• Venue: Google Meet – https://meet.google.com/nuk-nbbo-ptn
+• Speaker: Jeshua Cheng, Founder of Inquiryon
+
+[CONSTRAINTS]
+• Output HTML only (email-safe), concise and professional.
+• Include Inquiryon logo and tasteful AI‑themed visuals.
+• Clear CTA to join Google Meet and RSVP by reply.
