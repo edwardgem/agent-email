@@ -490,8 +490,21 @@ async function handleGenerateSend(req, res, body) {
 }
 
 const server = http.createServer(async (req, res) => {
+  // Allow cross-origin requests from AMP frontend
+  try {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  } catch (_) {}
+
   const parsed = url.parse(req.url, true);
   const method = req.method || 'GET';
+
+  if (method === 'OPTIONS') {
+    try { res.writeHead(204); } catch (_) {}
+    res.end();
+    return;
+  }
 
   if (method === 'GET' && parsed.pathname === '/health') {
     res.writeHead(200, { 'content-type': 'application/json' });
