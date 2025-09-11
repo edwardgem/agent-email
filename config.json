@@ -1,9 +1,5 @@
 {
   "instance_id": "email-20250909140103",
-  "amp_logger": {
-    "log_level": "DEBUG",
-      "log_folder_path": "/Users/EDCHENG/Projects/amp/logs/"
-  },
   "EMAIL_SUBJECT": "Safe AI Agents with Human-in-the-Loop - Brown Bag Session (8/22)",
   "SENDER_EMAIL": "edwardgem@gmail.com",
   "SENDER_NAME": "Edward Cheng, Inquiryon",
@@ -14,5 +10,12 @@
   ],
   "email": {
     "transport": "gmail-api"
+  },
+  "human-in-the-loop": {
+    "enable": false,
+    "what": null,
+    "when": null,
+    "who": null,
+    "why": null
   }
 }

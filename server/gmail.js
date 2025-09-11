@@ -4,10 +4,11 @@ function base64url(input) {
   return Buffer.from(input).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
-function buildMime({ fromName, fromEmail, to, bcc, subject, html }) {
+function buildMime({ fromName, fromEmail, to, cc, bcc, subject, html }) {
   const headers = [];
   headers.push(`From: ${fromName ? `${fromName} <${fromEmail}>` : fromEmail}`);
   headers.push(`To: ${to.join(', ')}`);
+  if (cc && cc.length) headers.push(`Cc: ${cc.join(', ')}`);
   if (bcc && bcc.length) headers.push(`Bcc: ${bcc.join(', ')}`);
   headers.push('MIME-Version: 1.0');
   headers.push('Content-Type: text/html; charset=UTF-8');
@@ -29,10 +30,10 @@ function getOAuth2Client() {
   return oAuth2Client;
 }
 
-async function sendEmail({ fromName, fromEmail, to, bcc, subject, html }) {
+async function sendEmail({ fromName, fromEmail, to, cc = [], bcc = [], subject, html }) {
   const auth = getOAuth2Client();
   const gmail = google.gmail({ version: 'v1', auth });
-  const raw = buildMime({ fromName, fromEmail, to, bcc, subject, html });
+  const raw = buildMime({ fromName, fromEmail, to, cc, bcc, subject, html });
   const res = await gmail.users.messages.send({
     userId: 'me',
     requestBody: { raw },
@@ -41,4 +42,3 @@ async function sendEmail({ fromName, fromEmail, to, bcc, subject, html }) {
 }
 
 module.exports = { sendEmail };
-

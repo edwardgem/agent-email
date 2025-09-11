@@ -25,41 +25,57 @@ This project generates an HTML email from a prompt, lets you review it, and send
 2. Install deps: `npm ci`
 3. Start the server via env loader: `bash run.sh`
    - Auto-reload during development: `bash run.sh dev`
-4. Health check: `curl -s http://localhost:3000/health`
+4. Health check: `curl -s http://localhost:3001/health`
 
 ## REST API Usage
 
 ### Generate Email HTML
 ```
-curl -X POST http://localhost:3000/api/email/generate \
+curl -X POST http://localhost:3001/api/email/generate \
   -H "Content-Type: application/json" \
   -d '{
     "instance_path": "/path/to/instance-folder"
   }'
 ```
-- If `instance_path` is provided, the server uses that folder's config, prompt, and outputs HTML to `artifacts/email.html` in the instance folder.
-- If not, it uses the global config and outputs to `outputs/email.html`.
-- You can override the prompt or output path by passing `promptText`, `promptFile`, or `htmlOutput` in the request body.
+- If `instance_path` is provided, the server uses that folder's config and prompt, and writes to `artifacts/email.html`.
+- If omitted, it uses the global `config.json` and writes to `outputs/email.html`.
+- Parameters:
+  - `promptText` (string) — Provide prompt content inline (overrides file).
+  - `promptFile` (string) — Optional path to prompt file (default: `prompt.txt`).
+  - `instructions` (string) — Semicolon-separated guidance; if present, the agent attempts to edit an existing HTML (see below).
+  - `htmlPath` or `sourceHtmlPath` (string) — Path to an existing HTML to modify when using `instructions`. If not provided, defaults to current output (`artifacts/email.html` for instances or `outputs/email.html`).
+  - `htmlOutput` (string) — Output path for the generated HTML. Default is per-instance `artifacts/email.html` (or `outputs/email.html`).
+  - LLM overrides (optional; otherwise use env): `provider`, `model`, `endpoint`, `options`.
+
+Edit mode behavior:
+- With `instructions` set, the agent tries to load the base HTML from `htmlPath`/`sourceHtmlPath` or the default output file, and instructs the model to modify it accordingly. If the explicitly provided path is missing, the request fails with a clear error.
 
 ### Send Email
 ```
-curl -X POST http://localhost:3000/api/email/send \
+curl -X POST http://localhost:3001/api/email/send \
   -H "Content-Type: application/json" \
   -d '{
     "instance_path": "/path/to/instance-folder"
   }'
 ```
-- If `htmlPath` is omitted, the server defaults to `artifacts/email.html` in the instance folder (if `instance_path` is set).
-- Sender, sender name, and recipients are loaded from the instance's `config.json`.
+- Parameters:
+  - `htmlPath` (string) — Path to the HTML to send. With `instance_path`, default is per-instance `artifacts/email.html`.
+  - `html` (string) — Inline HTML content to send (writes a temp file and uses it).
+  - `subject`, `senderEmail`, `senderName` (strings) — Optional overrides.
+  - Recipients from config.json:
+    - Preferred keys: `to`, `cc`, `bcc` (lowercase arrays of emails).
+    - Fallback legacy key: if none of `to`/`cc`/`bcc` are provided, `RECIPIENTS` will be used as BCC and `To` will default to the sender for privacy.
 
 ### Generate and Send (one call)
 ```
-curl -X POST http://localhost:3000/api/email/generate-send \
+curl -X POST http://localhost:3001/api/email/generate-send \
   -H "Content-Type: application/json" \
   -d '{
     "instance_path": "/path/to/instance-folder"
   }'
 ```
+- Parameters: Same as Generate for prompt control; then sends the resulting HTML.
+- Recipient handling: Currently follows the legacy behavior (To = sender, BCC = `RECIPIENTS` or request `recipients` if provided). For explicit `to`/`cc`/`bcc`, prefer calling `/generate` then `/send`.
 
 ## Config Format (config.json)
 ```
@@ -69,19 +85,12 @@ curl -X POST http://localhost:3000/api/email/generate-send \
   "SENDER_NAME": "Your Name",
   "HTML_OUTPUT": "artifacts/email.html",
   "PROMPT_FILE": "prompt.txt",
+  // Preferred: lowercase recipient lists
+  "to": ["a@example.com"],
+  "cc": ["team@example.com"],
+  "bcc": ["hidden@example.com"],
+  // Fallback legacy key: if to/cc/bcc missing, RECIPIENTS will be sent as BCC with To set to sender
   "RECIPIENTS": ["a@example.com", "b@example.com"],
-  "llm": {
-    "provider": "ollama",                 // or "openai"
-    "model": "llama3.1",                  // e.g., for openai: "gpt-4o-mini"
-    "endpoint": "http://127.0.0.1:11434", // Ollama endpoint
-    "options": {                           // provider-specific options
-      "temperature": 0.3,
-      "top_k": 40,
-      "top_p": 0.9,
-      "repeat_penalty": 1.1,
-      "num_ctx": 4096
-    }
-  },
   "email": { "transport": "gmail-api" }
 }
 ```
@@ -90,9 +99,18 @@ curl -X POST http://localhost:3000/api/email/generate-send \
 - The service sends one email To the sender and BCCs all recipients for privacy.
 - The LLM is prompted to return only HTML (preferably in ```html code fences). Review output before sending.
 - Set up credentials carefully; do not commit secrets.
-- Logs are written to `logs/run.log` (global) and per-instance `logs/run.log`.
+ - Logs are written to `logs/run.log` (global) and per-instance `logs/run.log`.
+   - Local logs always include full details (including full prompts and HTML content).
+   - The REST logging at `LOG_API_URL` captures state and key events for observability; it does not include full prompt/HTML content.
 - Temporary prompt files are written to `outputs/tmp/` (global) or `artifacts/tmp/` (per-instance).
 - meta.json in each instance folder tracks agent state.
+
+## LLM Configuration
+- Configure LLM via environment only (no config.json keys):
+  - `LLM_PROVIDER` (e.g., `ollama` or `openai`)
+  - `LLM_MODEL` (e.g., `llama3.1` or `gpt-4o-mini`)
+  - `LLM_ENDPOINT` (e.g., `http://127.0.0.1:11434`) — `OLLAMA_ENDPOINT` is also accepted as an alias
+  - Optional: `LLM_OPTIONS` as a JSON string (e.g., `{ "temperature": 0.2 }`)
 
 ## Endpoints
 - `GET /health` — health check

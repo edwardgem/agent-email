@@ -12,8 +12,8 @@ else
   echo "No .env file found (optional). Create one from .env.example to avoid manual exports."
 fi
 
-# Allow overriding Ollama endpoint via env, otherwise config.json controls defaults
-export OLLAMA_ENDPOINT=${OLLAMA_ENDPOINT:-}
+# Map legacy OLLAMA_ENDPOINT to LLM_ENDPOINT if provided
+export LLM_ENDPOINT=${LLM_ENDPOINT:-${OLLAMA_ENDPOINT:-}}
 
 mode=${1:-}
 if [[ "$mode" == "dev" ]]; then
