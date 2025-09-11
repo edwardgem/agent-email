@@ -75,7 +75,7 @@ curl -X POST http://localhost:3001/api/email/generate-send \
   }'
 ```
 - Parameters: Same as Generate for prompt control; then sends the resulting HTML.
-- Recipient handling: Currently follows the legacy behavior (To = sender, BCC = `RECIPIENTS` or request `recipients` if provided). For explicit `to`/`cc`/`bcc`, prefer calling `/generate` then `/send`.
+- Recipient handling: Matches `/send` — uses lowercase `to`/`cc`/`bcc` from config. If none are present, falls back to legacy behavior (To = sender, BCC = `RECIPIENTS`).
 
 ## Config Format (config.json)
 ```

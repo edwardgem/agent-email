@@ -397,7 +397,7 @@ async function handleSend(req, res, body) {
 async function handleGenerateSend(req, res, body) {
   try {
     // Generate first
-    // no-op
+    const instancePath = body.instance_path;
     const base = loadDefaultConfig();
     const promptPath = body.promptText ? writeTempPrompt(body.promptText) : (body.promptFile || base.PROMPT_FILE || path.join(REPO_ROOT, 'prompt.txt'));
     // Determine output path: per-instance artifacts/email.html if instance_path, else outputs/email.html
@@ -406,8 +406,8 @@ async function handleGenerateSend(req, res, body) {
       htmlOutput = body.htmlOutput;
     } else if (base.HTML_OUTPUT) {
       htmlOutput = base.HTML_OUTPUT;
-    } else if (body.instance_path) {
-      const paths = resolveAgentPaths(body.instance_path);
+    } else if (instancePath) {
+      const paths = resolveAgentPaths(instancePath);
       htmlOutput = path.join(paths.artifacts, 'email.html');
     } else {
       htmlOutput = path.join('outputs', 'email.html');
@@ -432,15 +432,56 @@ async function handleGenerateSend(req, res, body) {
     fs.writeFileSync(outputPath, html, 'utf8');
     appendLogLocal(`[PROGRESS] HTML email generated: ${outputPath}`);
 
-    // Then send
+    // Then send (use same to/cc/bcc logic as /send)
     const subject = body.subject || base.EMAIL_SUBJECT;
     const fromEmail = body.senderEmail || base.SENDER_EMAIL;
     const fromName = body.senderName || base.SENDER_NAME;
-    const recipients = Array.isArray(body.recipients) ? body.recipients : (base.RECIPIENTS || []);
-    const data = await sendEmail({ fromName, fromEmail, to: [fromEmail], bcc: recipients, subject, html });
+
+    function toArray(v) {
+      if (!v) return [];
+      if (Array.isArray(v)) return v.filter(Boolean);
+      if (typeof v === 'string') return v.split(',').map(s => s.trim()).filter(Boolean);
+      return [];
+    }
+    const toList = toArray(base.to);
+    const ccList = toArray(base.cc);
+    let bccList = toArray(base.bcc);
+    if (!toList.length && !ccList.length && !bccList.length) {
+      bccList = Array.isArray(base.RECIPIENTS) ? base.RECIPIENTS : [];
+    }
+
+    let toFinal = toList;
+    let ccFinal = ccList;
+    let bccFinal = bccList;
+    if (!toFinal.length && !ccFinal.length && !bccFinal.length) {
+      toFinal = [fromEmail];
+      ccFinal = [];
+      bccFinal = Array.isArray(base.RECIPIENTS) ? base.RECIPIENTS : [];
+    }
+
+    const pathsForLog = instancePath ? resolveAgentPaths(instancePath) : undefined;
+    appendLogLocal(`[PROGRESS] Sending email. to=${toFinal.join(', ')} cc=${ccFinal.join(', ')} bcc=${bccFinal.join(', ')}`,
+      pathsForLog ? pathsForLog.runLog : undefined);
+    const data = await sendEmail({ fromName, fromEmail, to: toFinal.length ? toFinal : [fromEmail], cc: ccFinal, bcc: bccFinal, subject, html });
 
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ ok: true, htmlPath: htmlOutput, id: data.id }));
+
+    // Log completed sending email and agent state finished
+    const nRecipients = (toFinal.length + ccFinal.length + bccFinal.length);
+    agent_log({ message: `completed sending email to ${nRecipients} recipients`, config: normalizeConfig(base) });
+    if (instancePath) {
+      const metaPath = require('path').join(resolveAgentPaths(instancePath).root, 'meta.json');
+      const metaErr = updateMetaJson(metaPath, 'finished');
+      if (metaErr) {
+        agent_log({ message: `meta.json error: ${metaErr}`, config: normalizeConfig(base), runLogOverride: pathsForLog ? pathsForLog.runLog : undefined });
+        agent_log({ message: 'state - abort', config: normalizeConfig(base), runLogOverride: pathsForLog ? pathsForLog.runLog : undefined });
+        return;
+      }
+      agent_log({ message: 'state - finished', config: normalizeConfig(base), runLogOverride: pathsForLog ? pathsForLog.runLog : undefined });
+    } else {
+      agent_log({ message: 'state - finished', config: normalizeConfig(base) });
+    }
   } catch (e) {
     console.log('[ERROR] handleGenerateSend exception:', e);
     res.writeHead(500, { 'content-type': 'application/json' });
