@@ -86,7 +86,7 @@ function readJsonBody(req) {
   });
 }
 
-// Helper to resolve all paths based on instance_path or fallback to project root
+// Helper to resolve all paths based on instance folder or fallback to project root
 function resolveAgentPaths(instancePath) {
   const root = instancePath ? path.resolve(instancePath) : path.resolve(__dirname, '..');
   return {
@@ -117,9 +117,11 @@ function isDebug() {
   return typeof lvl === 'string' && lvl.toUpperCase() === 'DEBUG';
 }
 
-function writeTempPrompt(promptText) {
+function writeTempPrompt(promptText, tmpDirOverride) {
   const fname = `prompt-${Date.now()}.txt`;
-  const p = path.join(TMP_DIR, fname);
+  const dir = tmpDirOverride || TMP_DIR;
+  fs.mkdirSync(dir, { recursive: true });
+  const p = path.join(dir, fname);
   fs.writeFileSync(p, promptText, 'utf8');
   return p;
 }
@@ -142,146 +144,196 @@ function injectKeyInstructionsIntoPrompt(promptText, instrSection) {
   return `${promptText}\n${instrSection}`;
 }
 
-async function handleGenerate(req, res, body) {
-  try {
-    // Instance path logic
-    const instancePath = body.instance_path;
-    let paths, base;
-    if (instancePath) {
-      console.log('[DEBUG] instancePath:', instancePath);
-      paths = resolveAgentPaths(instancePath);
-      //console.log('[DEBUG] resolved paths:', paths);
-      base = loadConfig(paths.config);
-      fs.mkdirSync(paths.logs, { recursive: true });
-      fs.mkdirSync(paths.artifacts, { recursive: true });
-      // Update meta.json for state active
-      const metaPath = require('path').join(paths.root, 'meta.json');
+// ---- Helper utilities for composing flows ----
+function resolveContext(body, { activate } = {}) {
+  // Determine instance folder from body.instance_id + AGENT_FOLDER
+  let instancePath;
+  if (body.instance_id) {
+    const baseFolder = process.env.AGENT_FOLDER;
+    if (!baseFolder) return { error: 'missing_env_AGENT_FOLDER' };
+    instancePath = path.join(baseFolder, body.instance_id);
+  }
+  let ctx = { instancePath, paths: undefined, base: undefined };
+  if (instancePath) {
+    const paths = resolveAgentPaths(instancePath);
+    const base = loadConfig(paths.config);
+    fs.mkdirSync(paths.logs, { recursive: true });
+    fs.mkdirSync(paths.artifacts, { recursive: true });
+    if (activate) {
+      const metaPath = path.join(paths.root, 'meta.json');
       const metaErr = updateMetaJson(metaPath, 'active');
-      if (metaErr) {
-        agent_log({ message: `meta.json error: ${metaErr}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
-        agent_log({ message: 'state - abort', config: normalizeConfig(base), runLogOverride: paths.runLog });
-        res.writeHead(400, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ error: `meta.json error: ${metaErr}` }));
-        return;
-      }
-      // Log agent state - active
+      if (metaErr) return { error: `meta.json error: ${metaErr}`, paths, base };
       agent_log({ message: 'state - active', config: normalizeConfig(base), runLogOverride: paths.runLog });
-      // Log instance folder path
-      appendLogLocal(`instance folder: ${paths.root}`);
-      // Error check: instance_id in config must match last part of instancePath
+      appendLogLocal(`instance folder: ${paths.root}`, paths.runLog);
       if (base.instance_id) {
-        const lastPart = require('path').basename(paths.root);
-        if (lastPart !== base.instance_id) {
-          const errMsg = `instance_id mismatch: config has '${base.instance_id}', folder is '${lastPart}'`;
-          agent_log({ message: errMsg, config: normalizeConfig(base), runLogOverride: paths.runLog });
-          agent_log({ message: 'state - abort', config: normalizeConfig(base), runLogOverride: paths.runLog });
-          res.writeHead(400, { 'content-type': 'application/json' });
-          res.end(JSON.stringify({ error: errMsg }));
-          return;
-        }
+        const lastPart = path.basename(paths.root);
+        if (lastPart !== base.instance_id) return { error: `instance_id mismatch: config has '${base.instance_id}', folder is '${lastPart}'`, paths, base };
       }
-    } else {
-      base = loadDefaultConfig();
-      // Log agent state - active
-      agent_log({ message: 'state - active', config: normalizeConfig(base) });
     }
-    const promptPath = body.promptText ? writeTempPrompt(body.promptText) : (body.promptFile || base.PROMPT_FILE || path.join(REPO_ROOT, 'prompt.txt'));
-    // Determine output path: for per-instance runs, always use artifacts/email.html unless htmlOutput is explicitly provided
-    let htmlOutput;
-    if (body.htmlOutput) {
-      htmlOutput = body.htmlOutput;
-    } else if (instancePath && paths && paths.artifacts) {
-      htmlOutput = path.join(paths.artifacts, 'email.html');
-    } else if (base.HTML_OUTPUT) {
-      htmlOutput = base.HTML_OUTPUT;
-    } else {
-      htmlOutput = path.join('outputs', 'email.html');
-    }
-    const promptText = body.promptText || fs.readFileSync(path.isAbsolute(promptPath) ? promptPath : path.join(REPO_ROOT, promptPath), 'utf8');
+    ctx.paths = paths;
+    ctx.base = base;
+    return ctx;
+  }
+  const base = loadDefaultConfig();
+  if (activate) agent_log({ message: 'state - active', config: normalizeConfig(base) });
+  ctx.base = base;
+  return ctx;
+}
 
-    const userInstr = (body.instructions || '').trim();
-    const keyInstrSection = buildKeyInstructionsSection(userInstr);
-    const promptWithKeys = injectKeyInstructionsIntoPrompt(promptText, keyInstrSection);
-    let enhancedPrompt;
+function resolvePromptPath(body, base, ctx) {
+  if (body.promptText) return writeTempPrompt(body.promptText, ctx.paths ? ctx.paths.tmp : undefined);
+  if (body.promptFile) return path.isAbsolute(body.promptFile) ? body.promptFile : (ctx.paths ? path.join(ctx.paths.root, body.promptFile) : path.join(REPO_ROOT, body.promptFile));
+  if (base.PROMPT_FILE) return path.isAbsolute(base.PROMPT_FILE) ? base.PROMPT_FILE : (ctx.paths ? path.join(ctx.paths.root, base.PROMPT_FILE) : path.join(REPO_ROOT, base.PROMPT_FILE));
+  return ctx.paths ? path.join(ctx.paths.root, 'prompt.txt') : path.join(REPO_ROOT, 'prompt.txt');
+}
 
-    // If user provides instructions, try to apply them to an existing HTML (edit mode)
-    if (userInstr) {
-      // Prefer an explicitly provided source HTML path; else default to current email.html
-      const srcPathRel = body.htmlPath || body.sourceHtmlPath || base.HTML_OUTPUT || path.join('outputs', 'email.html');
-      const srcPath = path.isAbsolute(srcPathRel) ? srcPathRel : path.join(REPO_ROOT, srcPathRel);
-      let baseHtml = '';
-      if (fs.existsSync(srcPath)) {
-        baseHtml = fs.readFileSync(srcPath, 'utf8');
-      } else {
-        // If user explicitly provided a path and it doesn't exist, error out; otherwise continue without baseHtml
-        if (body.htmlPath || body.sourceHtmlPath) {
-          res.writeHead(400, { 'content-type': 'application/json' });
-          res.end(JSON.stringify({ error: 'base_html_not_found', path: srcPathRel }));
-          return;
-        }
-      }
+function resolveOutputPathRel(body, base, ctx) {
+  if (body.htmlOutput) return body.htmlOutput;
+  if (ctx.paths && ctx.paths.artifacts) return path.join(ctx.paths.artifacts, 'email.html');
+  if (base.HTML_OUTPUT) return base.HTML_OUTPUT;
+  return path.join('outputs', 'email.html');
+}
 
-      if (baseHtml) {
-        enhancedPrompt = `${promptWithKeys}\n\nYou are updating an existing HTML email. Here is the current HTML to modify:\n\n\`\`\`html\n${baseHtml}\n\`\`\`\n\nIMPORTANT: Return ONLY the complete, updated HTML email wrapped in \`\`\`html code blocks. Do not include any explanation.`;
-      } else {
-        // No base HTML found; treat as fresh generation with key instructions injected
-        enhancedPrompt = `${promptWithKeys}\n\nIMPORTANT: Your response must contain ONLY the HTML email content wrapped in \`\`\`html code blocks.`;
-      }
-    } else {
-      // Original generation path (no extra instructions)
-      enhancedPrompt = `${promptWithKeys}\n\nIMPORTANT: Your response must contain ONLY the HTML email content wrapped in \`\`\`html code blocks.`;
-    }
+function preparePromptText(promptText, body, base, ctx) {
+  const userInstr = (body.instructions || '').trim();
+  const keyInstrSection = buildKeyInstructionsSection(userInstr);
+  const promptWithKeys = injectKeyInstructionsIntoPrompt(promptText, keyInstrSection);
+  if (!userInstr) return { prompt: `${promptWithKeys}\n\nIMPORTANT: Your response must contain ONLY the HTML email content wrapped in \`\`\`html code blocks.` };
+  const defaultBase = (ctx.paths && ctx.paths.artifacts) ? path.join(ctx.paths.artifacts, 'email.html') : (base.HTML_OUTPUT || path.join('outputs', 'email.html'));
+  const srcPathRel = body.htmlPath || body.sourceHtmlPath || defaultBase;
+  const srcPath = path.isAbsolute(srcPathRel) ? srcPathRel : (ctx.paths ? path.join(ctx.paths.root, srcPathRel) : path.join(REPO_ROOT, srcPathRel));
+  let baseHtml = '';
+  if (fs.existsSync(srcPath)) baseHtml = fs.readFileSync(srcPath, 'utf8');
+  else if (body.htmlPath || body.sourceHtmlPath) return { error: { code: 'base_html_not_found', path: srcPathRel } };
+  if (baseHtml) {
+    return { prompt: `${promptWithKeys}\n\nYou are updating an existing HTML email. Here is the current HTML to modify:\n\n\`\`\`html\n${baseHtml}\n\`\`\`\n\nIMPORTANT: Return ONLY the complete, updated HTML email wrapped in \`\`\`html code blocks. Do not include any explanation.` };
+  }
+  return { prompt: `${promptWithKeys}\n\nIMPORTANT: Your response must contain ONLY the HTML email content wrapped in \`\`\`html code blocks.` };
+}
 
-    // LLM config: request overrides, then env only (no config.json)
-    const provider = body.provider || process.env.LLM_PROVIDER || 'ollama';
-    // Accept OLLAMA_ENDPOINT alias via env-to-env mapping
-    const envEndpoint = process.env.LLM_ENDPOINT || process.env.OLLAMA_ENDPOINT || 'http://127.0.0.1:11434';
-    const model = body.model || process.env.LLM_MODEL || 'llama3.1';
-    const endpoint = body.endpoint || envEndpoint;
-    let options = body.options;
-    if (!options && process.env.LLM_OPTIONS) {
-      try { options = JSON.parse(process.env.LLM_OPTIONS); } catch (e) { options = {}; }
-    }
-    options = options || {};
+function getLLMConfig(body) {
+  const provider = body.provider || process.env.LLM_PROVIDER || 'ollama';
+  const envEndpoint = process.env.LLM_ENDPOINT || process.env.OLLAMA_ENDPOINT || 'http://127.0.0.1:11434';
+  const model = body.model || process.env.LLM_MODEL || 'llama3.1';
+  const endpoint = body.endpoint || envEndpoint;
+  let options = body.options;
+  if (!options && process.env.LLM_OPTIONS) { try { options = JSON.parse(process.env.LLM_OPTIONS); } catch (_) { options = {}; } }
+  return { provider, model, endpoint, options: options || {} };
+}
 
-    // Log the effective prompt and LLM config for debugging adherence
-    // Log prompt preparation (always include full content in local logs)
-    appendLogLocal('[INFO] Prompt prepared', instancePath ? paths.runLog : undefined);
-    appendLogLocal('--- Prompt Start ---', instancePath ? paths.runLog : undefined);
-    appendLogLocal(enhancedPrompt, instancePath ? paths.runLog : undefined);
-    appendLogLocal('--- Prompt End ---', instancePath ? paths.runLog : undefined);
-
-  const { html } = await generateHtml({ provider, model, endpoint, prompt: enhancedPrompt, options });
-  // Log completed generating email
-  // Use model name from config or resolved model variable
-  const modelName = model;
-  agent_log({ message: `completed generating email by ${modelName}`, config: normalizeConfig(base) });
-
-  const outputPath = path.isAbsolute(htmlOutput) ? htmlOutput : path.join(REPO_ROOT, htmlOutput);
-  console.log('[DEBUG] htmlOutput (API response):', htmlOutput);
-  console.log('[DEBUG] outputPath (actual file write):', outputPath);
+function writeHtmlWithArchive(outputPath, html, runLogPath) {
   fs.mkdirSync(path.dirname(outputPath), { recursive: true });
-  // If email.html exists, move it to email-1.html, email-2.html, etc.
   if (fs.existsSync(outputPath)) {
     const dir = path.dirname(outputPath);
     const baseName = path.basename(outputPath, '.html');
-    let n = 1;
-    let candidate;
-    do {
-      candidate = path.join(dir, `${baseName}-${n}.html`);
-      n++;
-    } while (fs.existsSync(candidate));
+    let n = 1; let candidate;
+    do { candidate = path.join(dir, `${baseName}-${n}.html`); n++; } while (fs.existsSync(candidate));
     fs.renameSync(outputPath, candidate);
-    appendLogLocal(`[INFO] Archived existing email.html to ${path.basename(candidate)}`,
-      instancePath ? paths.runLog : undefined);
+    appendLogLocal(`[INFO] Archived existing email.html to ${path.basename(candidate)}`, runLogPath);
   }
-  // Log before writing new HTML
-  appendLogLocal(`[PROGRESS] Generating HTML file: ${outputPath}`, instancePath ? paths.runLog : undefined);
-  appendLogLocal(`[CONTENT] HTML file content:\n${html}`, instancePath ? paths.runLog : undefined);
+  appendLogLocal(`[PROGRESS] Generating HTML file: ${outputPath}`, runLogPath);
+  appendLogLocal(`[CONTENT] HTML file content:\n${html}`, runLogPath);
   fs.writeFileSync(outputPath, html, 'utf8');
-  appendLogLocal(`[PROGRESS] HTML email generated: ${outputPath}`, instancePath ? paths.runLog : undefined);
-  res.writeHead(200, { 'content-type': 'application/json' });
-  res.end(JSON.stringify({ htmlPath: htmlOutput, html }));
+  appendLogLocal(`[PROGRESS] HTML email generated: ${outputPath}`, runLogPath);
+}
+
+function buildRecipients(base) {
+  function toArray(v) {
+    if (!v) return [];
+    if (Array.isArray(v)) return v.filter(Boolean);
+    if (typeof v === 'string') return v.split(',').map(s => s.trim()).filter(Boolean);
+    return [];
+  }
+  const toList = toArray(base.to);
+  const ccList = toArray(base.cc);
+  let bccList = toArray(base.bcc);
+  if (!toList.length && !ccList.length && !bccList.length) bccList = Array.isArray(base.RECIPIENTS) ? base.RECIPIENTS : [];
+  return { toList, ccList, bccList };
+}
+
+function materializeHtmlForSend(body, ctx) {
+  if (!body.html) return undefined;
+  const fname = `email-${Date.now()}.html`;
+  if (ctx.paths) {
+    const p = path.join(ctx.paths.tmp, fname);
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, body.html, 'utf8');
+    return p;
+  }
+  const rel = path.join('outputs', 'tmp', fname);
+  const abs = path.join(REPO_ROOT, rel);
+  fs.mkdirSync(path.dirname(abs), { recursive: true });
+  fs.writeFileSync(abs, body.html, 'utf8');
+  return rel;
+}
+
+function absoluteFromMaybeInstance(relOrAbs, ctx) {
+  if (path.isAbsolute(relOrAbs)) return relOrAbs;
+  return ctx.paths ? path.join(ctx.paths.root, relOrAbs) : path.join(REPO_ROOT, relOrAbs);
+}
+
+async function generateEmailFlow(body) {
+  const ctx = resolveContext(body, { activate: true });
+  if (ctx.error) return { error: ctx.error, ctx, base: ctx.base };
+  const base = ctx.base;
+  const promptPath = resolvePromptPath(body, base, ctx);
+  const promptText = body.promptText || fs.readFileSync(promptPath, 'utf8');
+  const prep = preparePromptText(promptText, body, base, ctx);
+  if (prep.error) return { errorObj: prep.error, ctx, base };
+  const { provider, model, endpoint, options } = getLLMConfig(body);
+  appendLogLocal('[INFO] Prompt prepared', ctx.paths ? ctx.paths.runLog : undefined);
+  appendLogLocal('--- Prompt Start ---', ctx.paths ? ctx.paths.runLog : undefined);
+  appendLogLocal(prep.prompt, ctx.paths ? ctx.paths.runLog : undefined);
+  appendLogLocal('--- Prompt End ---', ctx.paths ? ctx.paths.runLog : undefined);
+  const { html } = await generateHtml({ provider, model, endpoint, prompt: prep.prompt, options });
+  agent_log({ message: `completed generating email by ${model}`, config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
+  const htmlOutputRel = resolveOutputPathRel(body, base, ctx);
+  const outputPath = absoluteFromMaybeInstance(htmlOutputRel, ctx);
+  writeHtmlWithArchive(outputPath, html, ctx.paths ? ctx.paths.runLog : undefined);
+  return { html, htmlOutputRel, outputPath, base, ctx };
+}
+
+async function sendEmailFlow(body, baseMaybe, ctxMaybe, overrideHtml) {
+  const ctx = ctxMaybe || resolveContext(body, { activate: false });
+  const base = baseMaybe || ctx.base;
+  let htmlPath = body.htmlPath;
+  if (!htmlPath && body.html) htmlPath = materializeHtmlForSend(body, ctx);
+  if (!htmlPath && ctx.paths && ctx.paths.artifacts) htmlPath = path.join(ctx.paths.artifacts, 'email.html');
+  if (!htmlPath && !overrideHtml) return { error: 'missing_html_or_htmlPath' };
+  const html = overrideHtml || (htmlPath ? fs.readFileSync(absoluteFromMaybeInstance(htmlPath, ctx), 'utf8') : '');
+  const subject = body.subject || base.EMAIL_SUBJECT;
+  const fromEmail = body.senderEmail || base.SENDER_EMAIL;
+  const fromName = body.senderName || base.SENDER_NAME;
+  const { toList, ccList, bccList } = buildRecipients(base);
+  let toFinal = toList, ccFinal = ccList, bccFinal = bccList;
+  if (!toFinal.length && !ccFinal.length && !bccFinal.length) { toFinal = [fromEmail]; ccFinal = []; bccFinal = Array.isArray(base.RECIPIENTS) ? base.RECIPIENTS : []; }
+  appendLogLocal(`[PROGRESS] Sending email. to=${toFinal.join(', ')} cc=${ccFinal.join(', ')} bcc=${bccFinal.join(', ')}`,
+    ctx.paths ? ctx.paths.runLog : undefined);
+  const data = await sendEmail({ fromName, fromEmail, to: toFinal.length ? toFinal : [fromEmail], cc: ccFinal, bcc: bccFinal, subject, html });
+  agent_log({ message: `completed sending email to ${toFinal.length + ccFinal.length + bccFinal.length} recipients`, config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
+  return { id: data.id, ctx, base };
+}
+
+async function handleGenerate(req, res, body) {
+  try {
+    const gen = await generateEmailFlow(body);
+    if (gen.error) {
+      const { base, ctx } = gen;
+      if (ctx && ctx.paths) {
+        agent_log({ message: gen.error, config: normalizeConfig(base || {}), runLogOverride: ctx.paths.runLog });
+        agent_log({ message: 'state - abort', config: normalizeConfig(base || {}), runLogOverride: ctx.paths.runLog });
+      }
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: gen.error }));
+      return;
+    }
+    if (gen.errorObj) {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: gen.errorObj.code, path: gen.errorObj.path }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ htmlPath: gen.htmlOutputRel, html: gen.html }));
   } catch (e) {
     res.writeHead(500, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ error: e.message }));
@@ -296,94 +348,31 @@ function normalizeConfig(cfg) {
 
 async function handleSend(req, res, body) {
   try {
-    const instancePath = body.instance_path;
-    let paths, base;
-    if (instancePath) {
-      console.log('[DEBUG] instancePath:', instancePath);
-      paths = resolveAgentPaths(instancePath);
-      //console.log('[DEBUG] resolved paths:', paths);
-      base = loadConfig(paths.config);
-    } else {
-      base = loadDefaultConfig();
-    }
-    let htmlPath = body.htmlPath;
-    if (!htmlPath && body.html) {
-      const fname = `email-${Date.now()}.html`;
-      htmlPath = path.join('outputs', 'tmp', fname);
-      fs.mkdirSync(path.dirname(path.join(REPO_ROOT, htmlPath)), { recursive: true });
-      fs.writeFileSync(path.join(REPO_ROOT, htmlPath), body.html, 'utf8');
-    }
-
-    // Default to artifacts/email.html if instance_path is set and htmlPath is not provided
-    if (!htmlPath && instancePath && paths && paths.artifacts) {
-      htmlPath = path.join(paths.artifacts, 'email.html');
-    }
-
-    if (!htmlPath) {
+    const ctx = resolveContext(body, { activate: false });
+    if (ctx.error) {
       res.writeHead(400, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ error: 'missing_html_or_htmlPath' }));
+      res.end(JSON.stringify({ error: ctx.error }));
       return;
     }
-
-    const absoluteHtmlPath = path.isAbsolute(htmlPath) ? htmlPath : path.join(REPO_ROOT, htmlPath);
-    const html = fs.readFileSync(absoluteHtmlPath, 'utf8');
-
-    const subject = body.subject || base.EMAIL_SUBJECT;
-    const fromEmail = body.senderEmail || base.SENDER_EMAIL;
-    const fromName = body.senderName || base.SENDER_NAME;
-
-    // Read recipients: prefer lowercase to/cc/bcc in config; fallback to RECIPIENTS -> bcc behavior
-    function toArray(v) {
-      if (!v) return [];
-      if (Array.isArray(v)) return v.filter(Boolean);
-      if (typeof v === 'string') return v.split(',').map(s => s.trim()).filter(Boolean);
-      return [];
+    const base = ctx.base;
+    const sent = await sendEmailFlow(body, base, ctx);
+    if (sent.error) {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: sent.error }));
+      return;
     }
-    const toList = toArray(base.to);
-    const ccList = toArray(base.cc);
-    let bccList = toArray(base.bcc);
-    if (!toList.length && !ccList.length && !bccList.length) {
-      // Fallback to legacy RECIPIENTS as BCC
-      bccList = Array.isArray(base.RECIPIENTS) ? base.RECIPIENTS : [];
-    }
-
-    // Determine final envelope: if any of to/cc/bcc provided, use them; else legacy behavior
-    let toFinal = toList;
-    let ccFinal = ccList;
-    let bccFinal = bccList;
-    if (!toFinal.length && !ccFinal.length && !bccFinal.length) {
-      toFinal = [fromEmail];
-      ccFinal = [];
-      bccFinal = Array.isArray(base.RECIPIENTS) ? base.RECIPIENTS : [];
-    }
-
-    appendLogLocal(`[PROGRESS] Sending email. to=${toFinal.join(', ')} cc=${ccFinal.join(', ')} bcc=${bccFinal.join(', ')}`,
-      instancePath ? paths.runLog : undefined);
-    const data = await sendEmail({
-      fromName,
-      fromEmail,
-      to: toFinal.length ? toFinal : [fromEmail],
-      cc: ccFinal,
-      bcc: bccFinal,
-      subject,
-      html,
-    });
-    // Log completed sending email to N recipients
-    const nRecipients = (toFinal.length + ccFinal.length + bccFinal.length);
-    agent_log({ message: `completed sending email to ${nRecipients} recipients`, config: normalizeConfig(base) });
-
     res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, id: data.id }));
-    // Update meta.json for state finished
-    if (instancePath) {
-      const metaPath = require('path').join(paths.root, 'meta.json');
+    res.end(JSON.stringify({ ok: true, id: sent.id }));
+    // finalize state
+    if (ctx.paths) {
+      const metaPath = path.join(ctx.paths.root, 'meta.json');
       const metaErr = updateMetaJson(metaPath, 'finished');
       if (metaErr) {
-        agent_log({ message: `meta.json error: ${metaErr}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
-        agent_log({ message: 'state - abort', config: normalizeConfig(base), runLogOverride: paths.runLog });
+        agent_log({ message: `meta.json error: ${metaErr}`, config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
+        agent_log({ message: 'state - abort', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
         return;
       }
-      agent_log({ message: 'state - finished', config: normalizeConfig(base), runLogOverride: paths.runLog });
+      agent_log({ message: 'state - finished', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
     } else {
       agent_log({ message: 'state - finished', config: normalizeConfig(base) });
     }
@@ -396,91 +385,42 @@ async function handleSend(req, res, body) {
 
 async function handleGenerateSend(req, res, body) {
   try {
-    // Generate first
-    const instancePath = body.instance_path;
-    const base = loadDefaultConfig();
-    const promptPath = body.promptText ? writeTempPrompt(body.promptText) : (body.promptFile || base.PROMPT_FILE || path.join(REPO_ROOT, 'prompt.txt'));
-    // Determine output path: per-instance artifacts/email.html if instance_path, else outputs/email.html
-    let htmlOutput;
-    if (body.htmlOutput) {
-      htmlOutput = body.htmlOutput;
-    } else if (base.HTML_OUTPUT) {
-      htmlOutput = base.HTML_OUTPUT;
-    } else if (instancePath) {
-      const paths = resolveAgentPaths(instancePath);
-      htmlOutput = path.join(paths.artifacts, 'email.html');
-    } else {
-      htmlOutput = path.join('outputs', 'email.html');
+    const gen = await generateEmailFlow(body);
+    if (gen.error) {
+      const { base, ctx } = gen;
+      if (ctx && ctx.paths) {
+        agent_log({ message: gen.error, config: normalizeConfig(base || {}), runLogOverride: ctx.paths.runLog });
+        agent_log({ message: 'state - abort', config: normalizeConfig(base || {}), runLogOverride: ctx.paths.runLog });
+      }
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: gen.error }));
+      return;
     }
-    const promptText = body.promptText || fs.readFileSync(path.isAbsolute(promptPath) ? promptPath : path.join(REPO_ROOT, promptPath), 'utf8');
-    const enhancedPrompt = `${promptText}\n\nIMPORTANT: Your response must contain ONLY the HTML email content wrapped in \`\`\`html code blocks.`;
-    appendLogLocal('[INFO] Prompt prepared');
-    appendLogLocal('--- Prompt Start ---');
-    appendLogLocal(enhancedPrompt);
-    appendLogLocal('--- Prompt End ---');
-
-    // LLM config: request overrides, then env only (no config.json)
-    const provider = body.provider || process.env.LLM_PROVIDER || 'ollama';
-    const envEndpoint = process.env.LLM_ENDPOINT || process.env.OLLAMA_ENDPOINT || 'http://127.0.0.1:11434';
-    const model = body.model || process.env.LLM_MODEL || 'llama3.1';
-    const endpoint = body.endpoint || envEndpoint;
-    const options = body.options || (process.env.LLM_OPTIONS ? (()=>{ try { return JSON.parse(process.env.LLM_OPTIONS); } catch { return {}; } })() : {});
-    const { html } = await generateHtml({ provider, model, endpoint, prompt: enhancedPrompt, options });
-
-    const outputPath = path.isAbsolute(htmlOutput) ? htmlOutput : path.join(REPO_ROOT, htmlOutput);
-    fs.mkdirSync(path.dirname(outputPath), { recursive: true });
-    fs.writeFileSync(outputPath, html, 'utf8');
-    appendLogLocal(`[PROGRESS] HTML email generated: ${outputPath}`);
-
-    // Then send (use same to/cc/bcc logic as /send)
-    const subject = body.subject || base.EMAIL_SUBJECT;
-    const fromEmail = body.senderEmail || base.SENDER_EMAIL;
-    const fromName = body.senderName || base.SENDER_NAME;
-
-    function toArray(v) {
-      if (!v) return [];
-      if (Array.isArray(v)) return v.filter(Boolean);
-      if (typeof v === 'string') return v.split(',').map(s => s.trim()).filter(Boolean);
-      return [];
+    if (gen.errorObj) {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: gen.errorObj.code, path: gen.errorObj.path }));
+      return;
     }
-    const toList = toArray(base.to);
-    const ccList = toArray(base.cc);
-    let bccList = toArray(base.bcc);
-    if (!toList.length && !ccList.length && !bccList.length) {
-      bccList = Array.isArray(base.RECIPIENTS) ? base.RECIPIENTS : [];
+    const sent = await sendEmailFlow(body, gen.base, gen.ctx, gen.html);
+    if (sent.error) {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: sent.error }));
+      return;
     }
-
-    let toFinal = toList;
-    let ccFinal = ccList;
-    let bccFinal = bccList;
-    if (!toFinal.length && !ccFinal.length && !bccFinal.length) {
-      toFinal = [fromEmail];
-      ccFinal = [];
-      bccFinal = Array.isArray(base.RECIPIENTS) ? base.RECIPIENTS : [];
-    }
-
-    const pathsForLog = instancePath ? resolveAgentPaths(instancePath) : undefined;
-    appendLogLocal(`[PROGRESS] Sending email. to=${toFinal.join(', ')} cc=${ccFinal.join(', ')} bcc=${bccFinal.join(', ')}`,
-      pathsForLog ? pathsForLog.runLog : undefined);
-    const data = await sendEmail({ fromName, fromEmail, to: toFinal.length ? toFinal : [fromEmail], cc: ccFinal, bcc: bccFinal, subject, html });
-
     res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, htmlPath: htmlOutput, id: data.id }));
-
-    // Log completed sending email and agent state finished
-    const nRecipients = (toFinal.length + ccFinal.length + bccFinal.length);
-    agent_log({ message: `completed sending email to ${nRecipients} recipients`, config: normalizeConfig(base) });
-    if (instancePath) {
-      const metaPath = require('path').join(resolveAgentPaths(instancePath).root, 'meta.json');
+    res.end(JSON.stringify({ ok: true, htmlPath: gen.htmlOutputRel, id: sent.id }));
+    // finalize state for instances
+    if (gen.ctx && gen.ctx.paths) {
+      const metaPath = path.join(gen.ctx.paths.root, 'meta.json');
       const metaErr = updateMetaJson(metaPath, 'finished');
       if (metaErr) {
-        agent_log({ message: `meta.json error: ${metaErr}`, config: normalizeConfig(base), runLogOverride: pathsForLog ? pathsForLog.runLog : undefined });
-        agent_log({ message: 'state - abort', config: normalizeConfig(base), runLogOverride: pathsForLog ? pathsForLog.runLog : undefined });
+        agent_log({ message: `meta.json error: ${metaErr}`, config: normalizeConfig(gen.base), runLogOverride: gen.ctx.paths.runLog });
+        agent_log({ message: 'state - abort', config: normalizeConfig(gen.base), runLogOverride: gen.ctx.paths.runLog });
         return;
       }
-      agent_log({ message: 'state - finished', config: normalizeConfig(base), runLogOverride: pathsForLog ? pathsForLog.runLog : undefined });
+      agent_log({ message: 'state - finished', config: normalizeConfig(gen.base), runLogOverride: gen.ctx.paths.runLog });
     } else {
-      agent_log({ message: 'state - finished', config: normalizeConfig(base) });
+      agent_log({ message: 'state - finished', config: normalizeConfig(gen.base) });
     }
   } catch (e) {
     console.log('[ERROR] handleGenerateSend exception:', e);
@@ -512,7 +452,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  if (method === 'POST' && (parsed.pathname === '/api/email/generate' || parsed.pathname === '/api/email/send' || parsed.pathname === '/api/email/generate-send')) {
+  if (method === 'POST' && (parsed.pathname === '/api/email-agent/generate' || parsed.pathname === '/api/email-agent/send' || parsed.pathname === '/api/email-agent/generate-send')) {
     let body = {};
     try { body = await readJsonBody(req); } catch (e) {
       res.writeHead(400, { 'content-type': 'application/json' });
@@ -520,9 +460,9 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    if (parsed.pathname === '/api/email/generate') return handleGenerate(req, res, body);
-    if (parsed.pathname === '/api/email/send') return handleSend(req, res, body);
-    if (parsed.pathname === '/api/email/generate-send') return handleGenerateSend(req, res, body);
+    if (parsed.pathname === '/api/email-agent/generate') return handleGenerate(req, res, body);
+    if (parsed.pathname === '/api/email-agent/send') return handleSend(req, res, body);
+    if (parsed.pathname === '/api/email-agent/generate-send') return handleGenerateSend(req, res, body);
   }
 
   res.writeHead(404, { 'content-type': 'application/json' });

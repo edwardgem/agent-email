@@ -7,9 +7,9 @@ This project generates an HTML email from a prompt, lets you review it, and send
 - Gmail OAuth env vars set: `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET`, `GMAIL_REFRESH_TOKEN` (token for the account sending mail).
 
 ## Project Structure
-- `config.json` – Global config (used only if no instance_path is provided)
-- `outputs/` – Global outputs (used only if no instance_path is provided)
-- `logs/` – Global logs (used only if no instance_path is provided)
+- `config.json` – Global config (used only if no instance_id is provided)
+- `outputs/` – Global outputs (used only if no instance_id is provided)
+- `logs/` – Global logs (used only if no instance_id is provided)
 - `server/` – Server and logic code
 - Per-instance folders (recommended for production):
   - Each instance folder (e.g. `/path/to/email-20250909140103/`) contains:
@@ -20,7 +20,7 @@ This project generates an HTML email from a prompt, lets you review it, and send
     - `artifacts/` (per-instance outputs, e.g. `artifacts/email.html`)
 
 ## Quick Start (REST server)
-1. Copy `.env.example` to `.env` and fill in Gmail OAuth values:
+1. Copy `.env.example` to `.env` in the project root (same folder as `server/`) and fill in Gmail OAuth values:
    - `cp .env.example .env` (edit with your `GMAIL_*` values)
 2. Install deps: `npm ci`
 3. Start the server via env loader: `bash run.sh`
@@ -31,20 +31,22 @@ This project generates an HTML email from a prompt, lets you review it, and send
 
 ### Generate Email HTML
 ```
-curl -X POST http://localhost:3001/api/email/generate \
+curl -X POST http://localhost:3001/api/email-agent/generate \
   -H "Content-Type: application/json" \
   -d '{
-    "instance_path": "/path/to/instance-folder"
+    "instance_id": "email-20250909140103"
   }'
 ```
-- If `instance_path` is provided, the server uses that folder's config and prompt, and writes to `artifacts/email.html`.
-- If omitted, it uses the global `config.json` and writes to `outputs/email.html`.
+- Uses `process.env.AGENT_FOLDER` + `instance_id` to resolve the instance folder.
+- If provided, the server uses that folder's config and prompt, and writes to `artifacts/email.html`.
+- If not provided, it uses the global `config.json` and writes to `outputs/email.html`.
 - Parameters:
   - `promptText` (string) — Provide prompt content inline (overrides file).
   - `promptFile` (string) — Optional path to prompt file (default: `prompt.txt`).
   - `instructions` (string) — Semicolon-separated guidance; if present, the agent attempts to edit an existing HTML (see below).
   - `htmlPath` or `sourceHtmlPath` (string) — Path to an existing HTML to modify when using `instructions`. If not provided, defaults to current output (`artifacts/email.html` for instances or `outputs/email.html`).
   - `htmlOutput` (string) — Output path for the generated HTML. Default is per-instance `artifacts/email.html` (or `outputs/email.html`).
+  - `instance_id` (string) — Instance selector; requires `AGENT_FOLDER` in environment.
   - LLM overrides (optional; otherwise use env): `provider`, `model`, `endpoint`, `options`.
 
 Edit mode behavior:
@@ -52,14 +54,14 @@ Edit mode behavior:
 
 ### Send Email
 ```
-curl -X POST http://localhost:3001/api/email/send \
+curl -X POST http://localhost:3001/api/email-agent/send \
   -H "Content-Type: application/json" \
   -d '{
-    "instance_path": "/path/to/instance-folder"
+    "instance_id": "email-20250909140103"
   }'
 ```
 - Parameters:
-  - `htmlPath` (string) — Path to the HTML to send. With `instance_path`, default is per-instance `artifacts/email.html`.
+- `htmlPath` (string) — Path to the HTML to send. With instance context, default is per-instance `artifacts/email.html`.
   - `html` (string) — Inline HTML content to send (writes a temp file and uses it).
   - `subject`, `senderEmail`, `senderName` (strings) — Optional overrides.
   - Recipients from config.json:
@@ -68,10 +70,10 @@ curl -X POST http://localhost:3001/api/email/send \
 
 ### Generate and Send (one call)
 ```
-curl -X POST http://localhost:3001/api/email/generate-send \
+curl -X POST http://localhost:3001/api/email-agent/generate-send \
   -H "Content-Type: application/json" \
   -d '{
-    "instance_path": "/path/to/instance-folder"
+    "instance_id": "email-20250909140103"
   }'
 ```
 - Parameters: Same as Generate for prompt control; then sends the resulting HTML.
@@ -105,6 +107,10 @@ curl -X POST http://localhost:3001/api/email/generate-send \
 - Temporary prompt files are written to `outputs/tmp/` (global) or `artifacts/tmp/` (per-instance).
 - meta.json in each instance folder tracks agent state.
 
+## Environment
+- `AGENT_FOLDER`: Parent directory for all instance folders. Required when using `instance_id`.
+ - Note: The server reads environment variables from `.env` in this project root only. Do not place `.env` files in the instance folders; per-instance settings belong in each instance's `config.json`.
+
 ## LLM Configuration
 - Configure LLM via environment only (no config.json keys):
   - `LLM_PROVIDER` (e.g., `ollama` or `openai`)
@@ -114,9 +120,9 @@ curl -X POST http://localhost:3001/api/email/generate-send \
 
 ## Endpoints
 - `GET /health` — health check
-- `POST /api/email/generate` — generate HTML
-- `POST /api/email/send` — send email
-- `POST /api/email/generate-send` — generate and send in one call
+- `POST /api/email-agent/generate` — generate HTML
+- `POST /api/email-agent/send` — send email
+- `POST /api/email-agent/generate-send` — generate and send in one call
 
 ## Port Configuration
 - The default port is 3001. You can override it by setting the `PORT` environment variable:

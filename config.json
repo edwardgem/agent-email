@@ -5,8 +5,13 @@
   "SENDER_NAME": "Edward Cheng, Inquiryon",
   "HTML_OUTPUT": "outputs/email.html",
   "PROMPT_FILE": "prompt.txt",
-  "RECIPIENTS": [
+  "to": [],
+  "cc": [],
+  "bcc": [
     "edward.cheng@oracle.com"
+  ],
+  "RECIPIENTS": [
+    ""
   ],
   "email": {
     "transport": "gmail-api"

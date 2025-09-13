@@ -32,23 +32,25 @@ async function agent_log({ message, config, level = 'info', meta = {}, service =
   const instanceId = config.instance_id || 'unknown-instance';
   // Always log locally
   appendLogLocal(message, runLogOverride);
-  // Also send to REST API
-  try {
-    await fetch(LOG_API_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        service,
-        level,
-        message,
-        timestamp: new Date().toISOString(),
-        meta: { ...meta, instance_id: instanceId }
-      })
-    });
-  } catch (e) {
-    // Log REST errors locally as well
-    appendLogLocal(`[agent_log REST] Failed to log: ${e}`, runLogOverride);
-    console.error('[agent_log REST] Failed to log:', e);
+  // Only send to REST API for instance runs (indicated by runLogOverride)
+  if (runLogOverride) {
+    try {
+      await fetch(LOG_API_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          service,
+          level,
+          message,
+          timestamp: new Date().toISOString(),
+          meta: { ...meta, instance_id: instanceId }
+        })
+      });
+    } catch (e) {
+      // Log REST errors locally as well
+      appendLogLocal(`[agent_log REST] Failed to log: ${e}`, runLogOverride);
+      console.error('[agent_log REST] Failed to log:', e);
+    }
   }
 }
 
