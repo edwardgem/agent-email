@@ -16,8 +16,8 @@ function formatDateYMDHMS(date) {
   return `${date.getFullYear()}-${pad(date.getMonth()+1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
 
-// Helper to update meta.json for agent state
-function updateMetaJson(metaPath, state) {
+// Helper to update meta.json for agent state, with optional extra fields
+function updateMetaJson(metaPath, state, updates) {
   try {
     if (!fs.existsSync(metaPath)) {
       throw new Error(`meta.json not found at ${metaPath}`);
@@ -34,6 +34,26 @@ function updateMetaJson(metaPath, state) {
     } else if (state === 'abort') {
       meta.status = 'abort';
     }
+    if (updates && typeof updates === 'object') {
+      Object.assign(meta, updates);
+    }
+    fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2), 'utf8');
+    return null;
+  } catch (e) {
+    return e.message || String(e);
+  }
+}
+
+// Append a progress entry [timestamp, message] to meta.json
+function appendProgress(metaPath, message) {
+  try {
+    if (!fs.existsSync(metaPath)) {
+      throw new Error(`meta.json not found at ${metaPath}`);
+    }
+    const raw = fs.readFileSync(metaPath, 'utf8');
+    const meta = JSON.parse(raw);
+    if (!Array.isArray(meta.progress)) meta.progress = [];
+    meta.progress.push([formatDateYMDHMS(new Date()), String(message)]);
     fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2), 'utf8');
     return null;
   } catch (e) {
@@ -272,8 +292,8 @@ function absoluteFromMaybeInstance(relOrAbs, ctx) {
   return ctx.paths ? path.join(ctx.paths.root, relOrAbs) : path.join(REPO_ROOT, relOrAbs);
 }
 
-async function generateEmailFlow(body) {
-  const ctx = resolveContext(body, { activate: true });
+async function generateEmailFlow(body, ctxMaybe) {
+  const ctx = ctxMaybe || resolveContext(body, { activate: true });
   if (ctx.error) return { error: ctx.error, ctx, base: ctx.base };
   const base = ctx.base;
   const promptPath = resolvePromptPath(body, base, ctx);
@@ -285,11 +305,17 @@ async function generateEmailFlow(body) {
   appendLogLocal('--- Prompt Start ---', ctx.paths ? ctx.paths.runLog : undefined);
   appendLogLocal(prep.prompt, ctx.paths ? ctx.paths.runLog : undefined);
   appendLogLocal('--- Prompt End ---', ctx.paths ? ctx.paths.runLog : undefined);
+  // Progress: LLM generating email
+  if (ctx.paths) appendProgress(path.join(ctx.paths.root, 'meta.json'), 'llm generating email');
   const { html } = await generateHtml({ provider, model, endpoint, prompt: prep.prompt, options });
   agent_log({ message: `completed generating email by ${model}`, config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
+  // Progress: writing html output
+  if (ctx.paths) appendProgress(path.join(ctx.paths.root, 'meta.json'), 'writing html output');
   const htmlOutputRel = resolveOutputPathRel(body, base, ctx);
   const outputPath = absoluteFromMaybeInstance(htmlOutputRel, ctx);
   writeHtmlWithArchive(outputPath, html, ctx.paths ? ctx.paths.runLog : undefined);
+  // Progress: generated html
+  if (ctx.paths) appendProgress(path.join(ctx.paths.root, 'meta.json'), 'generated html');
   return { html, htmlOutputRel, outputPath, base, ctx };
 }
 
@@ -309,13 +335,77 @@ async function sendEmailFlow(body, baseMaybe, ctxMaybe, overrideHtml) {
   if (!toFinal.length && !ccFinal.length && !bccFinal.length) { toFinal = [fromEmail]; ccFinal = []; bccFinal = Array.isArray(base.RECIPIENTS) ? base.RECIPIENTS : []; }
   appendLogLocal(`[PROGRESS] Sending email. to=${toFinal.join(', ')} cc=${ccFinal.join(', ')} bcc=${bccFinal.join(', ')}`,
     ctx.paths ? ctx.paths.runLog : undefined);
+  // Progress: sending emails
+  if (ctx.paths) appendProgress(path.join(ctx.paths.root, 'meta.json'), 'sending emails');
   const data = await sendEmail({ fromName, fromEmail, to: toFinal.length ? toFinal : [fromEmail], cc: ccFinal, bcc: bccFinal, subject, html });
   agent_log({ message: `completed sending email to ${toFinal.length + ccFinal.length + bccFinal.length} recipients`, config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
+  // Progress: sent email
+  if (ctx.paths) appendProgress(path.join(ctx.paths.root, 'meta.json'), 'sent email');
   return { id: data.id, ctx, base };
 }
 
 async function handleGenerate(req, res, body) {
   try {
+    // Async mode: require instance_id and return 202 immediately after activation
+    if (body && body.async === true) {
+      if (!body.instance_id) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'async_requires_instance_id' }));
+        return;
+      }
+      const baseFolder = process.env.AGENT_FOLDER;
+      if (!baseFolder) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'missing_env_AGENT_FOLDER' }));
+        return;
+      }
+      const instancePath = path.join(baseFolder, body.instance_id);
+      const paths = resolveAgentPaths(instancePath);
+      fs.mkdirSync(paths.logs, { recursive: true });
+      fs.mkdirSync(paths.artifacts, { recursive: true });
+      const base = loadConfig(paths.config);
+      const jobId = `job-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const metaPath = path.join(paths.root, 'meta.json');
+      const metaErr = updateMetaJson(metaPath, 'active', { job_id: jobId, last_error: null });
+      if (metaErr) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: `meta.json error: ${metaErr}` }));
+        return;
+      }
+      agent_log({ message: `state - active (async generate) job_id=${jobId}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
+      // Return 202 Accepted with status link
+      const statusUrl = `/api/email-agent/status?instance_id=${encodeURIComponent(body.instance_id)}`;
+      res.writeHead(202, { 'content-type': 'application/json', Location: statusUrl });
+      res.end(JSON.stringify({ accepted: true, status: 'active', instance_id: body.instance_id, job_id: jobId, links: { status: statusUrl } }));
+      // Background task
+      setImmediate(async () => {
+        try {
+          const ctx = { paths, base };
+          const gen = await generateEmailFlow(body, ctx);
+          if (gen.error || gen.errorObj) {
+            const errMsg = gen.error || (gen.errorObj && `${gen.errorObj.code}${gen.errorObj.path ? ` (${gen.errorObj.path})` : ''}`) || 'unknown_error';
+            agent_log({ message: `async generate error: ${errMsg}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
+            const metaErr2 = updateMetaJson(metaPath, 'abort', { job_id: jobId, last_error: errMsg });
+            if (metaErr2) agent_log({ message: `meta.json error: ${metaErr2}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
+            agent_log({ message: 'state - abort', config: normalizeConfig(base), runLogOverride: paths.runLog });
+            return;
+          }
+          const metaErr3 = updateMetaJson(metaPath, 'finished', { job_id: jobId, last_error: null, last_html_path: gen.htmlOutputRel });
+          if (metaErr3) {
+            agent_log({ message: `meta.json error: ${metaErr3}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
+            agent_log({ message: 'state - abort', config: normalizeConfig(base), runLogOverride: paths.runLog });
+            return;
+          }
+          agent_log({ message: 'state - finished', config: normalizeConfig(base), runLogOverride: paths.runLog });
+        } catch (e) {
+          agent_log({ message: `async generate exception: ${e.stack || e.message}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
+          const metaErr4 = updateMetaJson(metaPath, 'abort', { job_id: jobId, last_error: String(e && (e.stack || e.message) || e) });
+          if (metaErr4) agent_log({ message: `meta.json error: ${metaErr4}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
+          agent_log({ message: 'state - abort', config: normalizeConfig(base), runLogOverride: paths.runLog });
+        }
+      });
+      return;
+    }
     const gen = await generateEmailFlow(body);
     if (gen.error) {
       const { base, ctx } = gen;
@@ -348,6 +438,63 @@ function normalizeConfig(cfg) {
 
 async function handleSend(req, res, body) {
   try {
+    // Async mode: require instance_id and return 202 immediately after activation
+    if (body && body.async === true) {
+      if (!body.instance_id) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'async_requires_instance_id' }));
+        return;
+      }
+      const baseFolder = process.env.AGENT_FOLDER;
+      if (!baseFolder) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'missing_env_AGENT_FOLDER' }));
+        return;
+      }
+      const instancePath = path.join(baseFolder, body.instance_id);
+      const paths = resolveAgentPaths(instancePath);
+      fs.mkdirSync(paths.logs, { recursive: true });
+      fs.mkdirSync(paths.artifacts, { recursive: true });
+      const base = loadConfig(paths.config);
+      const jobId = `job-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const metaPath = path.join(paths.root, 'meta.json');
+      const metaErr = updateMetaJson(metaPath, 'active', { job_id: jobId, last_error: null });
+      if (metaErr) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: `meta.json error: ${metaErr}` }));
+        return;
+      }
+      agent_log({ message: `state - active (async send) job_id=${jobId}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
+      const statusUrl = `/api/email-agent/status?instance_id=${encodeURIComponent(body.instance_id)}`;
+      res.writeHead(202, { 'content-type': 'application/json', Location: statusUrl });
+      res.end(JSON.stringify({ accepted: true, status: 'active', instance_id: body.instance_id, job_id: jobId, links: { status: statusUrl } }));
+      setImmediate(async () => {
+        try {
+          const ctx = { paths, base };
+          const sent = await sendEmailFlow(body, base, ctx);
+          if (sent.error) {
+            agent_log({ message: `async send error: ${sent.error}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
+            const metaErr2 = updateMetaJson(metaPath, 'abort', { job_id: jobId, last_error: sent.error });
+            if (metaErr2) agent_log({ message: `meta.json error: ${metaErr2}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
+            agent_log({ message: 'state - abort', config: normalizeConfig(base), runLogOverride: paths.runLog });
+            return;
+          }
+          const metaErr3 = updateMetaJson(metaPath, 'finished', { job_id: jobId, last_error: null, last_send_id: sent.id });
+          if (metaErr3) {
+            agent_log({ message: `meta.json error: ${metaErr3}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
+            agent_log({ message: 'state - abort', config: normalizeConfig(base), runLogOverride: paths.runLog });
+            return;
+          }
+          agent_log({ message: 'state - finished', config: normalizeConfig(base), runLogOverride: paths.runLog });
+        } catch (e) {
+          agent_log({ message: `async send exception: ${e.stack || e.message}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
+          const metaErr4 = updateMetaJson(metaPath, 'abort', { job_id: jobId, last_error: String(e && (e.stack || e.message) || e) });
+          if (metaErr4) agent_log({ message: `meta.json error: ${metaErr4}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
+          agent_log({ message: 'state - abort', config: normalizeConfig(base), runLogOverride: paths.runLog });
+        }
+      });
+      return;
+    }
     const ctx = resolveContext(body, { activate: false });
     if (ctx.error) {
       res.writeHead(400, { 'content-type': 'application/json' });
@@ -385,6 +532,72 @@ async function handleSend(req, res, body) {
 
 async function handleGenerateSend(req, res, body) {
   try {
+    // Async mode: require instance_id and return 202 immediately after activation
+    if (body && body.async === true) {
+      if (!body.instance_id) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'async_requires_instance_id' }));
+        return;
+      }
+      const baseFolder = process.env.AGENT_FOLDER;
+      if (!baseFolder) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'missing_env_AGENT_FOLDER' }));
+        return;
+      }
+      const instancePath = path.join(baseFolder, body.instance_id);
+      const paths = resolveAgentPaths(instancePath);
+      fs.mkdirSync(paths.logs, { recursive: true });
+      fs.mkdirSync(paths.artifacts, { recursive: true });
+      const base = loadConfig(paths.config);
+      const jobId = `job-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const metaPath = path.join(paths.root, 'meta.json');
+      const metaErr = updateMetaJson(metaPath, 'active', { job_id: jobId, last_error: null });
+      if (metaErr) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: `meta.json error: ${metaErr}` }));
+        return;
+      }
+      agent_log({ message: `state - active (async generate-send) job_id=${jobId}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
+      const statusUrl = `/api/email-agent/status?instance_id=${encodeURIComponent(body.instance_id)}`;
+      res.writeHead(202, { 'content-type': 'application/json', Location: statusUrl });
+      res.end(JSON.stringify({ accepted: true, status: 'active', instance_id: body.instance_id, job_id: jobId, links: { status: statusUrl } }));
+      setImmediate(async () => {
+        try {
+          const ctx = { paths, base };
+          const gen = await generateEmailFlow(body, ctx);
+          if (gen.error || gen.errorObj) {
+            const errMsg = gen.error || (gen.errorObj && `${gen.errorObj.code}${gen.errorObj.path ? ` (${gen.errorObj.path})` : ''}`) || 'unknown_error';
+            agent_log({ message: `async generate-send (generate) error: ${errMsg}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
+            const metaErr2 = updateMetaJson(metaPath, 'abort', { job_id: jobId, last_error: errMsg });
+            if (metaErr2) agent_log({ message: `meta.json error: ${metaErr2}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
+            agent_log({ message: 'state - abort', config: normalizeConfig(base), runLogOverride: paths.runLog });
+            return;
+          }
+          const sent = await sendEmailFlow(body, base, ctx, gen.html);
+          if (sent.error) {
+            agent_log({ message: `async generate-send (send) error: ${sent.error}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
+            const metaErr3 = updateMetaJson(metaPath, 'abort', { job_id: jobId, last_error: sent.error, last_html_path: gen.htmlOutputRel });
+            if (metaErr3) agent_log({ message: `meta.json error: ${metaErr3}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
+            agent_log({ message: 'state - abort', config: normalizeConfig(base), runLogOverride: paths.runLog });
+            return;
+          }
+          const metaErr4 = updateMetaJson(metaPath, 'finished', { job_id: jobId, last_error: null, last_html_path: gen.htmlOutputRel, last_send_id: sent.id });
+          if (metaErr4) {
+            agent_log({ message: `meta.json error: ${metaErr4}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
+            agent_log({ message: 'state - abort', config: normalizeConfig(base), runLogOverride: paths.runLog });
+            return;
+          }
+          agent_log({ message: 'state - finished', config: normalizeConfig(base), runLogOverride: paths.runLog });
+        } catch (e) {
+          agent_log({ message: `async generate-send exception: ${e.stack || e.message}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
+          const metaErr5 = updateMetaJson(metaPath, 'abort', { job_id: jobId, last_error: String(e && (e.stack || e.message) || e) });
+          if (metaErr5) agent_log({ message: `meta.json error: ${metaErr5}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
+          agent_log({ message: 'state - abort', config: normalizeConfig(base), runLogOverride: paths.runLog });
+        }
+      });
+      return;
+    }
     const gen = await generateEmailFlow(body);
     if (gen.error) {
       const { base, ctx } = gen;
@@ -449,6 +662,63 @@ const server = http.createServer(async (req, res) => {
   if (method === 'GET' && parsed.pathname === '/health') {
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ ok: true }));
+    return;
+  }
+
+  // Status endpoint: returns meta.json contents for an instance
+  if (method === 'GET' && parsed.pathname === '/api/email-agent/status') {
+    const instanceId = parsed.query && parsed.query.instance_id;
+    if (!instanceId) {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'missing_instance_id' }));
+      return;
+    }
+    const baseFolder = process.env.AGENT_FOLDER;
+    if (!baseFolder) {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'missing_env_AGENT_FOLDER' }));
+      return;
+    }
+    const instancePath = path.join(baseFolder, instanceId);
+    const metaPath = path.join(instancePath, 'meta.json');
+    try {
+      const raw = fs.readFileSync(metaPath, 'utf8');
+      const meta = JSON.parse(raw);
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ instance_id: instanceId, ...meta }));
+    } catch (e) {
+      res.writeHead(404, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: `meta_not_found_or_invalid: ${e.message}` }));
+    }
+    return;
+  }
+
+  // Progress endpoint: returns only the progress array for an instance
+  if (method === 'GET' && parsed.pathname === '/api/email-agent/progress') {
+    const instanceId = parsed.query && parsed.query.instance_id;
+    if (!instanceId) {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'missing_instance_id' }));
+      return;
+    }
+    const baseFolder = process.env.AGENT_FOLDER;
+    if (!baseFolder) {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'missing_env_AGENT_FOLDER' }));
+      return;
+    }
+    const instancePath = path.join(baseFolder, instanceId);
+    const metaPath = path.join(instancePath, 'meta.json');
+    try {
+      const raw = fs.readFileSync(metaPath, 'utf8');
+      const meta = JSON.parse(raw);
+      const progress = Array.isArray(meta.progress) ? meta.progress : [];
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ instance_id: instanceId, progress }));
+    } catch (e) {
+      res.writeHead(404, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: `meta_not_found_or_invalid: ${e.message}` }));
+    }
     return;
   }
 

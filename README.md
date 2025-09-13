@@ -47,6 +47,7 @@ curl -X POST http://localhost:3001/api/email-agent/generate \
   - `htmlPath` or `sourceHtmlPath` (string) — Path to an existing HTML to modify when using `instructions`. If not provided, defaults to current output (`artifacts/email.html` for instances or `outputs/email.html`).
   - `htmlOutput` (string) — Output path for the generated HTML. Default is per-instance `artifacts/email.html` (or `outputs/email.html`).
   - `instance_id` (string) — Instance selector; requires `AGENT_FOLDER` in environment.
+  - `async` (boolean) — If `true`, requires `instance_id` and returns `202 Accepted` immediately after activating the instance; processing continues in background. See Async Mode below.
   - LLM overrides (optional; otherwise use env): `provider`, `model`, `endpoint`, `options`.
 
 Edit mode behavior:
@@ -61,9 +62,10 @@ curl -X POST http://localhost:3001/api/email-agent/send \
   }'
 ```
 - Parameters:
-- `htmlPath` (string) — Path to the HTML to send. With instance context, default is per-instance `artifacts/email.html`.
+  - `htmlPath` (string) — Path to the HTML to send. With instance context, default is per-instance `artifacts/email.html`.
   - `html` (string) — Inline HTML content to send (writes a temp file and uses it).
   - `subject`, `senderEmail`, `senderName` (strings) — Optional overrides.
+  - `async` (boolean) — If `true`, requires `instance_id` and returns `202 Accepted` immediately after activating the instance; processing continues in background.
   - Recipients from config.json:
     - Preferred keys: `to`, `cc`, `bcc` (lowercase arrays of emails).
     - Fallback legacy key: if none of `to`/`cc`/`bcc` are provided, `RECIPIENTS` will be used as BCC and `To` will default to the sender for privacy.
@@ -78,6 +80,54 @@ curl -X POST http://localhost:3001/api/email-agent/generate-send \
 ```
 - Parameters: Same as Generate for prompt control; then sends the resulting HTML.
 - Recipient handling: Matches `/send` — uses lowercase `to`/`cc`/`bcc` from config. If none are present, falls back to legacy behavior (To = sender, BCC = `RECIPIENTS`).
+ - Supports `async: true` (requires `instance_id`).
+
+### Async Mode
+- For long-running operations, you can request asynchronous processing by setting `"async": true` and providing `"instance_id"`.
+- The server returns `202 Accepted` immediately after marking the instance `meta.json` to `status: "active"` and assigning a `job_id`.
+- Response example:
+```
+{
+  "accepted": true,
+  "status": "active",
+  "instance_id": "email-20250909140103",
+  "job_id": "job-1699999999999-abc123",
+  "links": { "status": "/api/email-agent/status?instance_id=email-20250909140103" }
+}
+```
+- The background task continues and will update `meta.json` high-level `status` to `"finished"` or `"abort"`, and set fields like `job_id`, `last_error`, `last_html_path`, and/or `last_send_id`.
+- Progress tracking is stored as an array in `meta.json` under `progress`, each item is `[timestamp, message]`:
+```
+{
+  "status": "active",
+  "job_id": "job-...",
+  "progress": [
+    ["2025-09-13 10:00:01", "llm generating email"],
+    ["2025-09-13 10:00:05", "writing html output"],
+    ["2025-09-13 10:00:10", "generated html"],
+    ["2025-09-13 10:00:15", "sending emails"],
+    ["2025-09-13 10:00:19", "sent email"]
+  ]
+}
+```
+
+Check status:
+```
+curl -s "http://localhost:3001/api/email-agent/status?instance_id=email-20250909140103"
+```
+- Returns content from the instance’s `meta.json`, e.g.:
+```
+{
+  "instance_id": "email-20250909140103",
+  "status": "finished",
+  "started_at": "2025-09-13 10:00:01",
+  "finished_at": "2025-09-13 10:01:45",
+  "job_id": "job-1699999999999-abc123",
+  "last_html_path": "artifacts/email.html",
+  "last_send_id": "188d5c1f1a2b3c4"
+}
+```
+On failure, expect `status: "abort"` and `last_error` populated.
 
 ## Config Format (config.json)
 ```
@@ -123,6 +173,8 @@ curl -X POST http://localhost:3001/api/email-agent/generate-send \
 - `POST /api/email-agent/generate` — generate HTML
 - `POST /api/email-agent/send` — send email
 - `POST /api/email-agent/generate-send` — generate and send in one call
+- `GET /api/email-agent/status?instance_id=...` — returns per-instance `meta.json` (status, job info)
+- `GET /api/email-agent/progress?instance_id=...` — returns `{ instance_id, progress: [...] }` from `meta.json`
 
 ## Port Configuration
 - The default port is 3001. You can override it by setting the `PORT` environment variable:
