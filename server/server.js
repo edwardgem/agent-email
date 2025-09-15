@@ -4,7 +4,8 @@ function loadConfig(configPath) {
   try {
     if (!fs.existsSync(configPath)) return {};
     const raw = fs.readFileSync(configPath, 'utf8');
-    return JSON.parse(raw);
+    const parsed = JSON.parse(raw);
+    return normalizeConfig(parsed);
   } catch (e) {
     console.log('[ERROR] loadConfig:', e);
     return {};
@@ -67,6 +68,7 @@ const http = require('http');
 const url = require('url');
 const fs = require('fs');
 const path = require('path');
+const fetch = require('node-fetch');
 const { generateHtml } = require('./llm');
 const { sendEmail } = require('./gmail');
 const { agent_log, appendLogLocal } = require('./logger');
@@ -125,7 +127,8 @@ function loadDefaultConfig() {
   try {
     if (!fs.existsSync(DEFAULT_CONFIG_PATH)) return {};
     const raw = fs.readFileSync(DEFAULT_CONFIG_PATH, 'utf8');
-    return JSON.parse(raw);
+    const parsed = JSON.parse(raw);
+    return normalizeConfig(parsed);
   } catch (e) {
     console.log('[ERROR] loadDefaultConfig:', e);
     return {};
@@ -267,7 +270,6 @@ function buildRecipients(base) {
   const toList = toArray(base.to);
   const ccList = toArray(base.cc);
   let bccList = toArray(base.bcc);
-  if (!toList.length && !ccList.length && !bccList.length) bccList = Array.isArray(base.RECIPIENTS) ? base.RECIPIENTS : [];
   return { toList, ccList, bccList };
 }
 
@@ -292,6 +294,59 @@ function absoluteFromMaybeInstance(relOrAbs, ctx) {
   return ctx.paths ? path.join(ctx.paths.root, relOrAbs) : path.join(REPO_ROOT, relOrAbs);
 }
 
+// ---- Human-in-the-loop (HITL) integration ----
+// These helpers encapsulate the configuration and the REST call to the external
+// HITL agent. The send flow below uses them to block on human approval,
+// optionally apply human-provided HTML, or re-generate based on human input.
+function getInstanceIdFromCtx(ctx) {
+  if (ctx && ctx.paths && ctx.paths.root) return path.basename(ctx.paths.root);
+  return undefined;
+}
+
+function getHitlApiUrl() {
+  // Expect full URL in env; if only a path is provided, prepend http://localhost:3001
+  let u = process.env.HITL_API_URL || '/api/hitl-agent';
+  if (u.startsWith('/')) {
+    const port = process.env.HITL_API_PORT || process.env.PORT || 3001;
+    return `http://127.0.0.1:${port}${u}`;
+  }
+  return u;
+}
+
+function getHitlConfig(base) {
+  const a = base && base['human-in-the-loop'];
+  const b = base && base['HITL'];
+  const c = base && base['hitl'];
+  return a || b || c || {};
+}
+
+/**
+ * Call the configured HITL REST endpoint with current context.
+ * Expects a JSON response with one of the statuses:
+ *  - no-hitl: proceed without blocking
+ *  - approve: proceed (optionally with html/htmlPath overrides)
+ *  - reject: abort the run
+ *  - has-input: use provided input/inputText to regenerate, then re-check
+ */
+async function callHitlAgent({ instanceId, htmlPath, html, ctx, base, loopIndex }) {
+  const url = getHitlApiUrl();
+  const hitlCfg = getHitlConfig(base);
+  const payload = { instance_id: instanceId, html_path: htmlPath, html, hitl: hitlCfg, HITL: base && base['HITL'], human_in_the_loop: base && base['human-in-the-loop'], loop: loopIndex };
+  try {
+    const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+    if (!res.ok) return { error: `hitl_http_${res.status}` };
+    const data = await res.json();
+    // Normalize fields
+    const status = (data && (data.status || data.decision || data.result)) || 'no-hitl';
+    const input = data && (data.input || data.inputText || data.instructions || data.note || '');
+    const htmlOverride = data && (data.html || data.html_content);
+    const htmlPathOverride = data && (data.htmlPath || data.html_path);
+    return { status, input, htmlOverride, htmlPathOverride };
+  } catch (e) {
+    return { error: `hitl_request_failed: ${e.message}` };
+  }
+}
+
 async function generateEmailFlow(body, ctxMaybe) {
   const ctx = ctxMaybe || resolveContext(body, { activate: true });
   if (ctx.error) return { error: ctx.error, ctx, base: ctx.base };
@@ -306,41 +361,194 @@ async function generateEmailFlow(body, ctxMaybe) {
   appendLogLocal(prep.prompt, ctx.paths ? ctx.paths.runLog : undefined);
   appendLogLocal('--- Prompt End ---', ctx.paths ? ctx.paths.runLog : undefined);
   // Progress: LLM generating email
-  if (ctx.paths) appendProgress(path.join(ctx.paths.root, 'meta.json'), 'llm generating email');
+  if (ctx.paths) {
+    appendProgress(path.join(ctx.paths.root, 'meta.json'), 'llm generating email');
+    agent_log({ message: 'llm generating email', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
+  }
   const { html } = await generateHtml({ provider, model, endpoint, prompt: prep.prompt, options });
-  agent_log({ message: `completed generating email by ${model}`, config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
+  agent_log({ message: `completed generating email using LLM (model: ${model})`, config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
   // Progress: writing html output
-  if (ctx.paths) appendProgress(path.join(ctx.paths.root, 'meta.json'), 'writing html output');
+  if (ctx.paths) {
+    appendProgress(path.join(ctx.paths.root, 'meta.json'), 'writing html output');
+    agent_log({ message: 'writing html output', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
+  }
   const htmlOutputRel = resolveOutputPathRel(body, base, ctx);
   const outputPath = absoluteFromMaybeInstance(htmlOutputRel, ctx);
   writeHtmlWithArchive(outputPath, html, ctx.paths ? ctx.paths.runLog : undefined);
   // Progress: generated html
-  if (ctx.paths) appendProgress(path.join(ctx.paths.root, 'meta.json'), 'generated html');
+  if (ctx.paths) {
+    appendProgress(path.join(ctx.paths.root, 'meta.json'), 'generated html');
+    agent_log({ message: 'generated html', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
+  }
   return { html, htmlOutputRel, outputPath, base, ctx };
 }
 
 async function sendEmailFlow(body, baseMaybe, ctxMaybe, overrideHtml) {
   const ctx = ctxMaybe || resolveContext(body, { activate: false });
   const base = baseMaybe || ctx.base;
+  // Validate that HITL config section exists for instance runs
+  if (ctx.paths) {
+    const hasHitlSection = !!(base && (base['human-in-the-loop'] || base['HITL'] || base['hitl']));
+    if (!hasHitlSection) {
+      const metaPath = path.join(ctx.paths.root, 'meta.json');
+      const msg = 'missing_hitl_config_section';
+      appendProgress(metaPath, msg);
+      agent_log({ message: msg, config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
+      const err = updateMetaJson(metaPath, 'abort', { last_error: msg });
+      if (err) agent_log({ message: `meta.json error: ${err}`, config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
+      agent_log({ message: 'state - abort', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
+      return { error: msg, ctx, base };
+    }
+  }
   let htmlPath = body.htmlPath;
   if (!htmlPath && body.html) htmlPath = materializeHtmlForSend(body, ctx);
   if (!htmlPath && ctx.paths && ctx.paths.artifacts) htmlPath = path.join(ctx.paths.artifacts, 'email.html');
   if (!htmlPath && !overrideHtml) return { error: 'missing_html_or_htmlPath' };
-  const html = overrideHtml || (htmlPath ? fs.readFileSync(absoluteFromMaybeInstance(htmlPath, ctx), 'utf8') : '');
+  let html = overrideHtml || (htmlPath ? fs.readFileSync(absoluteFromMaybeInstance(htmlPath, ctx), 'utf8') : '');
   const subject = body.subject || base.EMAIL_SUBJECT;
   const fromEmail = body.senderEmail || base.SENDER_EMAIL;
   const fromName = body.senderName || base.SENDER_NAME;
   const { toList, ccList, bccList } = buildRecipients(base);
   let toFinal = toList, ccFinal = ccList, bccFinal = bccList;
-  if (!toFinal.length && !ccFinal.length && !bccFinal.length) { toFinal = [fromEmail]; ccFinal = []; bccFinal = Array.isArray(base.RECIPIENTS) ? base.RECIPIENTS : []; }
+  if (!toFinal.length && !ccFinal.length && !bccFinal.length) {
+    return { error: 'no_recipients_configured' };
+  }
   appendLogLocal(`[PROGRESS] Sending email. to=${toFinal.join(', ')} cc=${ccFinal.join(', ')} bcc=${bccFinal.join(', ')}`,
     ctx.paths ? ctx.paths.runLog : undefined);
+  // HITL review loop before sending
+  // Enforces presence of a HITL config for instance runs and executes a
+  // request → decision → optional regenerate → loop cycle.
+  const instanceId = getInstanceIdFromCtx(ctx);
+  const metaPath = ctx.paths ? path.join(ctx.paths.root, 'meta.json') : undefined;
+  let loops = 0;
+  const maxLoops = Number(process.env.HITL_MAX_LOOPS || 3);
+  const hitlEnabled = !!getHitlConfig(base).enable;
+  while (true) {
+    // Call HITL agent
+    if (ctx.paths) {
+      const loopMsg = loops === 0 ? 'awaiting human input' : `awaiting human input (loop ${loops})`;
+      appendProgress(metaPath, loopMsg);
+      agent_log({ message: loopMsg, config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
+    }
+    if (ctx.paths && loops > 0) {
+      appendProgress(metaPath, `hitl loop back #${loops}`);
+      agent_log({ message: `hitl loop back #${loops}`, config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
+    }
+    const decision = await callHitlAgent({ instanceId, htmlPath, html, ctx, base, loopIndex: loops });
+    if (decision && decision.error) {
+      if (ctx.paths) {
+        appendProgress(metaPath, `hitl error: ${decision.error}`);
+        agent_log({ message: `hitl error: ${decision.error}`, config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
+      }
+      if (hitlEnabled) {
+        if (ctx.paths) {
+          const err = updateMetaJson(metaPath, 'abort', { last_error: decision.error });
+          if (err) agent_log({ message: `meta.json error: ${err}`, config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
+          agent_log({ message: 'state - abort', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
+        }
+        return { error: decision.error, ctx, base };
+      } else {
+        // Proceed without blocking when disabled
+        if (ctx.paths) {
+          appendProgress(metaPath, 'hitl error (proceeding without block)');
+          agent_log({ message: 'hitl error (proceeding without block)', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
+        }
+        break;
+      }
+    }
+    const status = (decision && decision.status) || 'no-hitl';
+    if (status === 'no-hitl' || status === 'approve') {
+      // Use override HTML if provided by HITL
+      if (decision && decision.htmlOverride) {
+        html = String(decision.htmlOverride);
+      } else if (decision && decision.htmlPathOverride) {
+        const p = absoluteFromMaybeInstance(decision.htmlPathOverride, ctx);
+        if (fs.existsSync(p)) html = fs.readFileSync(p, 'utf8');
+        htmlPath = decision.htmlPathOverride;
+      }
+      if (ctx.paths) {
+        appendProgress(metaPath, 'hitl approved');
+        agent_log({ message: 'hitl approved', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
+      }
+      break;
+    }
+    if (status === 'reject') {
+      if (ctx.paths) {
+        appendProgress(metaPath, 'hitl rejected');
+        agent_log({ message: 'hitl rejected', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
+        const err = updateMetaJson(metaPath, 'abort', { last_error: 'hitl_rejected' });
+        if (err) agent_log({ message: `meta.json error: ${err}`, config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
+        agent_log({ message: 'state - abort', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
+      }
+      return { error: 'hitl_rejected', ctx, base };
+    }
+    if (status === 'has-input') {
+      const extraRaw = (decision && (decision.input || decision.inputText || ''));
+      const extra = String(extraRaw == null ? '' : extraRaw).trim();
+      if (ctx.paths) {
+        appendProgress(metaPath, `hitl input: ${extra}`);
+        agent_log({ message: `hitl input: ${extra}`, config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
+      }
+      if (!extra) {
+        // No extra input, treat as approve
+        if (ctx.paths) {
+          appendProgress(metaPath, 'hitl approve (empty input)');
+          agent_log({ message: 'hitl approve (empty input)', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
+        }
+        break;
+      }
+      // Regenerate HTML with extra instructions
+      if (ctx.paths) {
+        appendProgress(metaPath, 'hitl provided input; regenerating html');
+        agent_log({ message: 'hitl provided input; regenerating html', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
+      }
+      const regenBody = { ...body, instructions: extra, // append via KEY INSTRUCTIONS
+        // preserve any model/provider settings already passed
+        provider: body.provider, model: body.model, endpoint: body.endpoint, options: body.options };
+      const regen = await generateEmailFlow(regenBody, ctx);
+      if (regen.error || regen.errorObj) {
+        const errMsg = regen.error || (regen.errorObj && regen.errorObj.code) || 'hitl_regen_failed';
+        if (ctx.paths) {
+          appendProgress(metaPath, `hitl regen error: ${errMsg}`);
+          agent_log({ message: `hitl regen error: ${errMsg}`, config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
+          const err = updateMetaJson(metaPath, 'abort', { last_error: errMsg });
+          if (err) agent_log({ message: `meta.json error: ${err}`, config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
+          agent_log({ message: 'state - abort', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
+        }
+        return { error: errMsg, ctx, base };
+      }
+      html = regen.html;
+      htmlPath = regen.htmlOutputRel;
+      loops += 1;
+      if (loops >= maxLoops) {
+        if (ctx.paths) {
+          appendProgress(metaPath, 'hitl loop limit reached');
+          agent_log({ message: 'hitl loop limit reached', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
+        }
+        break;
+      }
+      // Loop back to HITL review again
+      continue;
+    }
+    // Unknown status: proceed
+    if (ctx.paths) {
+      appendProgress(metaPath, `hitl unknown status: ${status} (proceeding)`);
+      agent_log({ message: `hitl unknown status: ${status} (proceeding)`, config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
+    }
+    break;
+  }
   // Progress: sending emails
-  if (ctx.paths) appendProgress(path.join(ctx.paths.root, 'meta.json'), 'sending emails');
+  if (ctx.paths) {
+    appendProgress(path.join(ctx.paths.root, 'meta.json'), 'sending emails');
+    agent_log({ message: 'sending emails', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
+  }
   const data = await sendEmail({ fromName, fromEmail, to: toFinal.length ? toFinal : [fromEmail], cc: ccFinal, bcc: bccFinal, subject, html });
   agent_log({ message: `completed sending email to ${toFinal.length + ccFinal.length + bccFinal.length} recipients`, config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
   // Progress: sent email
-  if (ctx.paths) appendProgress(path.join(ctx.paths.root, 'meta.json'), 'sent email');
+  if (ctx.paths) {
+    appendProgress(path.join(ctx.paths.root, 'meta.json'), 'sent email');
+    agent_log({ message: 'sent email', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
+  }
   return { id: data.id, ctx, base };
 }
 
@@ -364,19 +572,18 @@ async function handleGenerate(req, res, body) {
       fs.mkdirSync(paths.logs, { recursive: true });
       fs.mkdirSync(paths.artifacts, { recursive: true });
       const base = loadConfig(paths.config);
-      const jobId = `job-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       const metaPath = path.join(paths.root, 'meta.json');
-      const metaErr = updateMetaJson(metaPath, 'active', { job_id: jobId, last_error: null });
+      const metaErr = updateMetaJson(metaPath, 'active', { last_error: null });
       if (metaErr) {
         res.writeHead(400, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ error: `meta.json error: ${metaErr}` }));
         return;
       }
-      agent_log({ message: `state - active (async generate) job_id=${jobId}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
+      agent_log({ message: 'state - active (async generate)', config: normalizeConfig(base), runLogOverride: paths.runLog });
       // Return 202 Accepted with status link
       const statusUrl = `/api/email-agent/status?instance_id=${encodeURIComponent(body.instance_id)}`;
       res.writeHead(202, { 'content-type': 'application/json', Location: statusUrl });
-      res.end(JSON.stringify({ accepted: true, status: 'active', instance_id: body.instance_id, job_id: jobId, links: { status: statusUrl } }));
+      res.end(JSON.stringify({ accepted: true, status: 'active', instance_id: body.instance_id, links: { status: statusUrl } }));
       // Background task
       setImmediate(async () => {
         try {
@@ -385,12 +592,12 @@ async function handleGenerate(req, res, body) {
           if (gen.error || gen.errorObj) {
             const errMsg = gen.error || (gen.errorObj && `${gen.errorObj.code}${gen.errorObj.path ? ` (${gen.errorObj.path})` : ''}`) || 'unknown_error';
             agent_log({ message: `async generate error: ${errMsg}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
-            const metaErr2 = updateMetaJson(metaPath, 'abort', { job_id: jobId, last_error: errMsg });
+            const metaErr2 = updateMetaJson(metaPath, 'abort', { last_error: errMsg });
             if (metaErr2) agent_log({ message: `meta.json error: ${metaErr2}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
             agent_log({ message: 'state - abort', config: normalizeConfig(base), runLogOverride: paths.runLog });
             return;
           }
-          const metaErr3 = updateMetaJson(metaPath, 'finished', { job_id: jobId, last_error: null, last_html_path: gen.htmlOutputRel });
+          const metaErr3 = updateMetaJson(metaPath, 'finished', { last_error: null, last_html_path: gen.htmlOutputRel });
           if (metaErr3) {
             agent_log({ message: `meta.json error: ${metaErr3}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
             agent_log({ message: 'state - abort', config: normalizeConfig(base), runLogOverride: paths.runLog });
@@ -399,7 +606,7 @@ async function handleGenerate(req, res, body) {
           agent_log({ message: 'state - finished', config: normalizeConfig(base), runLogOverride: paths.runLog });
         } catch (e) {
           agent_log({ message: `async generate exception: ${e.stack || e.message}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
-          const metaErr4 = updateMetaJson(metaPath, 'abort', { job_id: jobId, last_error: String(e && (e.stack || e.message) || e) });
+          const metaErr4 = updateMetaJson(metaPath, 'abort', { last_error: String(e && (e.stack || e.message) || e) });
           if (metaErr4) agent_log({ message: `meta.json error: ${metaErr4}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
           agent_log({ message: 'state - abort', config: normalizeConfig(base), runLogOverride: paths.runLog });
         }
@@ -433,7 +640,19 @@ async function handleGenerate(req, res, body) {
 
 // Helper to normalize config for logger (handles amp_logger as object or string)
 function normalizeConfig(cfg) {
-  return cfg || {};
+  const c = (cfg && typeof cfg === 'object') ? { ...cfg } : {};
+  // Back-compat: accept lowercase keys and promote to legacy uppercase keys used internally
+  if (c.email_subject && !c.EMAIL_SUBJECT) c.EMAIL_SUBJECT = c.email_subject;
+  if (c.sender_email && !c.SENDER_EMAIL) c.SENDER_EMAIL = c.sender_email;
+  if (c.sender_name && !c.SENDER_NAME) c.SENDER_NAME = c.sender_name;
+  if (c.html_output && !c.HTML_OUTPUT) c.HTML_OUTPUT = c.html_output;
+  if (c.prompt_file && !c.PROMPT_FILE) c.PROMPT_FILE = c.prompt_file;
+  // Ensure recipient lists are arrays
+  const arr = v => Array.isArray(v) ? v : (typeof v === 'string' ? v.split(',').map(s => s.trim()).filter(Boolean) : []);
+  if (c.to) c.to = arr(c.to);
+  if (c.cc) c.cc = arr(c.cc);
+  if (c.bcc) c.bcc = arr(c.bcc);
+  return c;
 }
 
 async function handleSend(req, res, body) {
@@ -456,30 +675,29 @@ async function handleSend(req, res, body) {
       fs.mkdirSync(paths.logs, { recursive: true });
       fs.mkdirSync(paths.artifacts, { recursive: true });
       const base = loadConfig(paths.config);
-      const jobId = `job-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       const metaPath = path.join(paths.root, 'meta.json');
-      const metaErr = updateMetaJson(metaPath, 'active', { job_id: jobId, last_error: null });
+      const metaErr = updateMetaJson(metaPath, 'active', { last_error: null });
       if (metaErr) {
         res.writeHead(400, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ error: `meta.json error: ${metaErr}` }));
         return;
       }
-      agent_log({ message: `state - active (async send) job_id=${jobId}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
+      agent_log({ message: 'state - active (async send)', config: normalizeConfig(base), runLogOverride: paths.runLog });
       const statusUrl = `/api/email-agent/status?instance_id=${encodeURIComponent(body.instance_id)}`;
       res.writeHead(202, { 'content-type': 'application/json', Location: statusUrl });
-      res.end(JSON.stringify({ accepted: true, status: 'active', instance_id: body.instance_id, job_id: jobId, links: { status: statusUrl } }));
+      res.end(JSON.stringify({ accepted: true, status: 'active', instance_id: body.instance_id, links: { status: statusUrl } }));
       setImmediate(async () => {
         try {
           const ctx = { paths, base };
           const sent = await sendEmailFlow(body, base, ctx);
           if (sent.error) {
             agent_log({ message: `async send error: ${sent.error}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
-            const metaErr2 = updateMetaJson(metaPath, 'abort', { job_id: jobId, last_error: sent.error });
+            const metaErr2 = updateMetaJson(metaPath, 'abort', { last_error: sent.error });
             if (metaErr2) agent_log({ message: `meta.json error: ${metaErr2}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
             agent_log({ message: 'state - abort', config: normalizeConfig(base), runLogOverride: paths.runLog });
             return;
           }
-          const metaErr3 = updateMetaJson(metaPath, 'finished', { job_id: jobId, last_error: null, last_send_id: sent.id });
+          const metaErr3 = updateMetaJson(metaPath, 'finished', { last_error: null, last_send_id: sent.id });
           if (metaErr3) {
             agent_log({ message: `meta.json error: ${metaErr3}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
             agent_log({ message: 'state - abort', config: normalizeConfig(base), runLogOverride: paths.runLog });
@@ -488,7 +706,7 @@ async function handleSend(req, res, body) {
           agent_log({ message: 'state - finished', config: normalizeConfig(base), runLogOverride: paths.runLog });
         } catch (e) {
           agent_log({ message: `async send exception: ${e.stack || e.message}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
-          const metaErr4 = updateMetaJson(metaPath, 'abort', { job_id: jobId, last_error: String(e && (e.stack || e.message) || e) });
+          const metaErr4 = updateMetaJson(metaPath, 'abort', { last_error: String(e && (e.stack || e.message) || e) });
           if (metaErr4) agent_log({ message: `meta.json error: ${metaErr4}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
           agent_log({ message: 'state - abort', config: normalizeConfig(base), runLogOverride: paths.runLog });
         }
@@ -550,18 +768,17 @@ async function handleGenerateSend(req, res, body) {
       fs.mkdirSync(paths.logs, { recursive: true });
       fs.mkdirSync(paths.artifacts, { recursive: true });
       const base = loadConfig(paths.config);
-      const jobId = `job-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       const metaPath = path.join(paths.root, 'meta.json');
-      const metaErr = updateMetaJson(metaPath, 'active', { job_id: jobId, last_error: null });
+      const metaErr = updateMetaJson(metaPath, 'active', { last_error: null });
       if (metaErr) {
         res.writeHead(400, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ error: `meta.json error: ${metaErr}` }));
         return;
       }
-      agent_log({ message: `state - active (async generate-send) job_id=${jobId}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
+      agent_log({ message: 'state - active (async generate-send)', config: normalizeConfig(base), runLogOverride: paths.runLog });
       const statusUrl = `/api/email-agent/status?instance_id=${encodeURIComponent(body.instance_id)}`;
       res.writeHead(202, { 'content-type': 'application/json', Location: statusUrl });
-      res.end(JSON.stringify({ accepted: true, status: 'active', instance_id: body.instance_id, job_id: jobId, links: { status: statusUrl } }));
+      res.end(JSON.stringify({ accepted: true, status: 'active', instance_id: body.instance_id, links: { status: statusUrl } }));
       setImmediate(async () => {
         try {
           const ctx = { paths, base };
@@ -569,7 +786,7 @@ async function handleGenerateSend(req, res, body) {
           if (gen.error || gen.errorObj) {
             const errMsg = gen.error || (gen.errorObj && `${gen.errorObj.code}${gen.errorObj.path ? ` (${gen.errorObj.path})` : ''}`) || 'unknown_error';
             agent_log({ message: `async generate-send (generate) error: ${errMsg}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
-            const metaErr2 = updateMetaJson(metaPath, 'abort', { job_id: jobId, last_error: errMsg });
+            const metaErr2 = updateMetaJson(metaPath, 'abort', { last_error: errMsg });
             if (metaErr2) agent_log({ message: `meta.json error: ${metaErr2}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
             agent_log({ message: 'state - abort', config: normalizeConfig(base), runLogOverride: paths.runLog });
             return;
@@ -577,12 +794,12 @@ async function handleGenerateSend(req, res, body) {
           const sent = await sendEmailFlow(body, base, ctx, gen.html);
           if (sent.error) {
             agent_log({ message: `async generate-send (send) error: ${sent.error}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
-            const metaErr3 = updateMetaJson(metaPath, 'abort', { job_id: jobId, last_error: sent.error, last_html_path: gen.htmlOutputRel });
+            const metaErr3 = updateMetaJson(metaPath, 'abort', { last_error: sent.error, last_html_path: gen.htmlOutputRel });
             if (metaErr3) agent_log({ message: `meta.json error: ${metaErr3}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
             agent_log({ message: 'state - abort', config: normalizeConfig(base), runLogOverride: paths.runLog });
             return;
           }
-          const metaErr4 = updateMetaJson(metaPath, 'finished', { job_id: jobId, last_error: null, last_html_path: gen.htmlOutputRel, last_send_id: sent.id });
+          const metaErr4 = updateMetaJson(metaPath, 'finished', { last_error: null, last_html_path: gen.htmlOutputRel, last_send_id: sent.id });
           if (metaErr4) {
             agent_log({ message: `meta.json error: ${metaErr4}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
             agent_log({ message: 'state - abort', config: normalizeConfig(base), runLogOverride: paths.runLog });
@@ -591,7 +808,7 @@ async function handleGenerateSend(req, res, body) {
           agent_log({ message: 'state - finished', config: normalizeConfig(base), runLogOverride: paths.runLog });
         } catch (e) {
           agent_log({ message: `async generate-send exception: ${e.stack || e.message}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
-          const metaErr5 = updateMetaJson(metaPath, 'abort', { job_id: jobId, last_error: String(e && (e.stack || e.message) || e) });
+          const metaErr5 = updateMetaJson(metaPath, 'abort', { last_error: String(e && (e.stack || e.message) || e) });
           if (metaErr5) agent_log({ message: `meta.json error: ${metaErr5}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
           agent_log({ message: 'state - abort', config: normalizeConfig(base), runLogOverride: paths.runLog });
         }
@@ -665,6 +882,42 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Dev-only: mock HITL endpoint (enable with env HITL_MOCK=1 or true)
+  if (method === 'POST' && parsed.pathname === '/api/hitl-agent') {
+    const enabled = String(process.env.HITL_MOCK || '').toLowerCase();
+    if (!(enabled === '1' || enabled === 'true' || process.env.NODE_ENV === 'development')) {
+      res.writeHead(404, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'hitl_mock_disabled' }));
+      return;
+    }
+    let body = {};
+    try { body = await readJsonBody(req); } catch (e) {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'invalid_json' }));
+      return;
+    }
+    // Optional query overrides: ?decision=approve|reject|has-input|no-hitl
+    const decisionOverride = parsed.query && (parsed.query.decision || parsed.query.status);
+    const htmlOverride = parsed.query && parsed.query.html;
+    const htmlPathOverride = parsed.query && parsed.query.htmlPath;
+    const loop = Number(body.loop || 0);
+    const decision = (decisionOverride && String(decisionOverride))
+      || (loop < 1 ? 'has-input' : 'approve');
+    // Default input for has-input; echo through if provided
+    const inputText = Object.prototype.hasOwnProperty.call(body, 'input') ? body.input
+      : (Object.prototype.hasOwnProperty.call(body, 'inputText') ? body.inputText
+      : 'Please add a clear CTA button and a P.S. line.');
+    const resp = { status: decision };
+    if (decision === 'has-input') resp.inputText = inputText || '';
+    if (decision === 'approve') {
+      if (htmlOverride) resp.html = htmlOverride;
+      if (htmlPathOverride) resp.htmlPath = htmlPathOverride;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(resp));
+    return;
+  }
+
   // Status endpoint: returns meta.json contents for an instance
   if (method === 'GET' && parsed.pathname === '/api/email-agent/status') {
     const instanceId = parsed.query && parsed.query.instance_id;
@@ -693,8 +946,38 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Progress endpoint: returns only the progress array for an instance
+  // Progress endpoint: returns only the latest progress entry for an instance
   if (method === 'GET' && parsed.pathname === '/api/email-agent/progress') {
+    const instanceId = parsed.query && parsed.query.instance_id;
+    if (!instanceId) {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'missing_instance_id' }));
+      return;
+    }
+    const baseFolder = process.env.AGENT_FOLDER;
+    if (!baseFolder) {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'missing_env_AGENT_FOLDER' }));
+      return;
+    }
+    const instancePath = path.join(baseFolder, instanceId);
+    const metaPath = path.join(instancePath, 'meta.json');
+    try {
+      const raw = fs.readFileSync(metaPath, 'utf8');
+      const meta = JSON.parse(raw);
+      const progress = Array.isArray(meta.progress) ? meta.progress : [];
+      const latest = progress.length ? progress[progress.length - 1] : null;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ instance_id: instanceId, latest }));
+    } catch (e) {
+      res.writeHead(404, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: `meta_not_found_or_invalid: ${e.message}` }));
+    }
+    return;
+  }
+
+  // Progress-all endpoint: returns the full progress array for an instance
+  if (method === 'GET' && parsed.pathname === '/api/email-agent/progress-all') {
     const instanceId = parsed.query && parsed.query.instance_id;
     if (!instanceId) {
       res.writeHead(400, { 'content-type': 'application/json' });

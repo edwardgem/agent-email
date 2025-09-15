@@ -67,8 +67,7 @@ curl -X POST http://localhost:3001/api/email-agent/send \
   - `subject`, `senderEmail`, `senderName` (strings) — Optional overrides.
   - `async` (boolean) — If `true`, requires `instance_id` and returns `202 Accepted` immediately after activating the instance; processing continues in background.
   - Recipients from config.json:
-    - Preferred keys: `to`, `cc`, `bcc` (lowercase arrays of emails).
-    - Fallback legacy key: if none of `to`/`cc`/`bcc` are provided, `RECIPIENTS` will be used as BCC and `To` will default to the sender for privacy.
+    - Keys: `to`, `cc`, `bcc` (lowercase arrays of emails). At least one must be non-empty.
 
 ### Generate and Send (one call)
 ```
@@ -79,28 +78,47 @@ curl -X POST http://localhost:3001/api/email-agent/generate-send \
   }'
 ```
 - Parameters: Same as Generate for prompt control; then sends the resulting HTML.
-- Recipient handling: Matches `/send` — uses lowercase `to`/`cc`/`bcc` from config. If none are present, falls back to legacy behavior (To = sender, BCC = `RECIPIENTS`).
+- Recipient handling: Matches `/send` — uses lowercase `to`/`cc`/`bcc` from config. If none are present, the request fails with `no_recipients_configured`.
  - Supports `async: true` (requires `instance_id`).
 
 ### Async Mode
 - For long-running operations, you can request asynchronous processing by setting `"async": true` and providing `"instance_id"`.
-- The server returns `202 Accepted` immediately after marking the instance `meta.json` to `status: "active"` and assigning a `job_id`.
+- The server returns `202 Accepted` immediately after marking the instance `meta.json` to `status: "active"`.
 - Response example:
 ```
 {
   "accepted": true,
   "status": "active",
   "instance_id": "email-20250909140103",
-  "job_id": "job-1699999999999-abc123",
   "links": { "status": "/api/email-agent/status?instance_id=email-20250909140103" }
 }
 ```
-- The background task continues and will update `meta.json` high-level `status` to `"finished"` or `"abort"`, and set fields like `job_id`, `last_error`, `last_html_path`, and/or `last_send_id`.
+
+### HITL Config
+Add one of the following sections to enable/define HITL behavior for instance runs:
+```
+{
+  "human-in-the-loop": { "enable": true }
+}
+```
+or
+```
+{
+  "HITL": { "enable": false }
+}
+```
+or
+```
+{
+  "hitl": { "enable": true }
+}
+```
+At least one of `human-in-the-loop`, `HITL`, or `hitl` must be present; otherwise the send flow aborts with `missing_hitl_config_section`.
+- The background task continues and will update `meta.json` high-level `status` to `"finished"` or `"abort"`, and set fields like `last_error`, `last_html_path`, and/or `last_send_id`.
 - Progress tracking is stored as an array in `meta.json` under `progress`, each item is `[timestamp, message]`:
 ```
 {
   "status": "active",
-  "job_id": "job-...",
   "progress": [
     ["2025-09-13 10:00:01", "llm generating email"],
     ["2025-09-13 10:00:05", "writing html output"],
@@ -122,7 +140,6 @@ curl -s "http://localhost:3001/api/email-agent/status?instance_id=email-20250909
   "status": "finished",
   "started_at": "2025-09-13 10:00:01",
   "finished_at": "2025-09-13 10:01:45",
-  "job_id": "job-1699999999999-abc123",
   "last_html_path": "artifacts/email.html",
   "last_send_id": "188d5c1f1a2b3c4"
 }
@@ -132,34 +149,46 @@ On failure, expect `status: "abort"` and `last_error` populated.
 ## Config Format (config.json)
 ```
 {
-  "EMAIL_SUBJECT": "Subject line",
-  "SENDER_EMAIL": "you@example.com",
-  "SENDER_NAME": "Your Name",
-  "HTML_OUTPUT": "artifacts/email.html",
-  "PROMPT_FILE": "prompt.txt",
-  // Preferred: lowercase recipient lists
+  "email_subject": "Subject line",
+  "sender_email": "you@example.com",
+  "sender_name": "Your Name",
+  "html_output": "artifacts/email.html",
+  "prompt_file": "prompt.txt",
+  // Recipient lists
   "to": ["a@example.com"],
   "cc": ["team@example.com"],
   "bcc": ["hidden@example.com"],
-  // Fallback legacy key: if to/cc/bcc missing, RECIPIENTS will be sent as BCC with To set to sender
-  "RECIPIENTS": ["a@example.com", "b@example.com"],
   "email": { "transport": "gmail-api" }
 }
 ```
+Backward compatibility: Uppercase keys (`EMAIL_SUBJECT`, `SENDER_EMAIL`, `SENDER_NAME`, `HTML_OUTPUT`, `PROMPT_FILE`) are still supported and normalized internally.
 
 ## Notes
-- The service sends one email To the sender and BCCs all recipients for privacy.
+- Provide recipients via `to`/`cc`/`bcc` in the instance config; at least one must be non-empty.
 - The LLM is prompted to return only HTML (preferably in ```html code fences). Review output before sending.
 - Set up credentials carefully; do not commit secrets.
  - Logs are written to `logs/run.log` (global) and per-instance `logs/run.log`.
    - Local logs always include full details (including full prompts and HTML content).
    - The REST logging at `LOG_API_URL` captures state and key events for observability; it does not include full prompt/HTML content.
+  - Progress events are mirrored to logging: each progress update (llm generating email, writing html output, generated html, sending emails, sent email) is also emitted via `agent_log` and, for per-instance runs, POSTed to `LOG_API_URL`.
+- Human-in-the-loop (HITL): Before sending, the agent calls a HITL endpoint to get a decision and optional input.
+  - Configure `HITL_API_URL` in `.env` (e.g., `HITL_API_URL=http://localhost:4001/api/hitl-agent`). If you set only a path like `/api/hitl-agent`, it will default to the current server port.
+  - Request body includes: `{ instance_id, html_path?, html?, hitl: <instance HITL config>, HITL: <raw HITL section>, human_in_the_loop: <raw human-in-the-loop section>, loop: <current loop index> }`.
+  - HITL decisions supported: `no-hitl` (proceed), `approve` (proceed, optionally using returned `html` or `htmlPath`), `reject` (set status to `abort` and stop), `has-input` (append the `input`/`inputText` under `[KEY INSTRUCTIONS]` and regenerate HTML, then re-check HITL; limited by `HITL_MAX_LOOPS`, default 3).
+  - Error policy: If the instance config’s `human-in-the-loop.enable` or `HITL.enable` is true, a HITL error aborts the run; otherwise the agent proceeds (still logs the error).
+  - Looping: Each loop back is logged and recorded in progress with the loop number; HITL input text is logged to progress/agent log even if empty.
+  - Config requirement: For instance runs, your `config.json` must include a HITL section under one of these keys: `"human-in-the-loop"`, `"HITL"`, or `"hitl"`. If missing, the run aborts with error `missing_hitl_config_section`.
+  - Dev mock: You can enable a built-in mock endpoint by setting `HITL_MOCK=1` in `.env`. It exposes `POST /api/hitl-agent` directly on this server. Default behavior: first call returns `{ status: "has-input", inputText: "Please add a clear CTA button and a P.S. line." }`, subsequent loops return `{ status: "approve" }`. You can override via query `?decision=approve|reject|has-input|no-hitl` and optional `&html=...` or `&htmlPath=...` when approving.
 - Temporary prompt files are written to `outputs/tmp/` (global) or `artifacts/tmp/` (per-instance).
 - meta.json in each instance folder tracks agent state.
 
 ## Environment
 - `AGENT_FOLDER`: Parent directory for all instance folders. Required when using `instance_id`.
  - Note: The server reads environment variables from `.env` in this project root only. Do not place `.env` files in the instance folders; per-instance settings belong in each instance's `config.json`.
+ - HITL settings:
+   - `HITL_API_URL`: Absolute URL (e.g., `http://localhost:4000/api/hitl-agent`) or path (e.g., `/api/hitl-agent`). If path, the server will call `http://127.0.0.1:<HITL_API_PORT || PORT || 3001>`.
+   - `HITL_API_PORT`: Optional port to use when `HITL_API_URL` is a path.
+   - `HITL_MAX_LOOPS`: Optional max cycles for regenerate-review (default 3).
 
 ## LLM Configuration
 - Configure LLM via environment only (no config.json keys):
@@ -174,11 +203,15 @@ On failure, expect `status: "abort"` and `last_error` populated.
 - `POST /api/email-agent/send` — send email
 - `POST /api/email-agent/generate-send` — generate and send in one call
 - `GET /api/email-agent/status?instance_id=...` — returns per-instance `meta.json` (status, job info)
-- `GET /api/email-agent/progress?instance_id=...` — returns `{ instance_id, progress: [...] }` from `meta.json`
+- `GET /api/email-agent/progress?instance_id=...` — returns `{ instance_id, latest: [timestamp, message] | null }`
+- `GET /api/email-agent/progress-all?instance_id=...` — returns `{ instance_id, progress: [[timestamp, message], ...] }`
+ - HITL (external): `POST /api/hitl-agent` — not implemented here; expected to accept `{ instance_id, html_path?, html? }` and return e.g. `{ status: "approve" | "reject" | "has-input" | "no-hitl", input?, html?, htmlPath? }`.
 
 ## Port Configuration
 - The default port is 3001. You can override it by setting the `PORT` environment variable:
   - `PORT=3005 bash run.sh`
 
-## Legacy
-- The legacy shell script is kept for reference but is not required for REST operation.
+## CLI Sender (optional)
+- A standalone CLI script `mcp_email_sender.sh` can generate and send emails without the REST server using Claude CLI + Gmail MCP.
+- It reads the same config keys: `email_subject`, `sender_email`, `sender_name`, `html_output`, `prompt_file`, and recipient lists `to`/`cc`/`bcc`.
+- Use it when you prefer a quick CLI workflow or for debugging without running the REST server.

@@ -4,5 +4,5 @@
   "SENDER_NAME": "Edward Cheng, Inquiryon",
   "HTML_OUTPUT": "outputs/inquiryon_lab_invitation.html",
   "PROMPT_FILE": "prompt.txt",
-  "RECIPIENTS": []
+  "bcc": []
 }

@@ -1,17 +1,14 @@
 {
   "instance_id": "email-20250909140103",
-  "EMAIL_SUBJECT": "Safe AI Agents with Human-in-the-Loop - Brown Bag Session (8/22)",
-  "SENDER_EMAIL": "edwardgem@gmail.com",
-  "SENDER_NAME": "Edward Cheng, Inquiryon",
-  "HTML_OUTPUT": "outputs/email.html",
-  "PROMPT_FILE": "prompt.txt",
+  "email_subject": "Safe AI Agents with Human-in-the-Loop - Brown Bag Session (8/22)",
+  "sender_email": "edwardgem@gmail.com",
+  "sender_name": "Edward Cheng, Inquiryon",
+  "html_output": "outputs/email.html",
+  "prompt_file": "prompt.txt",
   "to": [],
   "cc": [],
   "bcc": [
     "edward.cheng@oracle.com"
-  ],
-  "RECIPIENTS": [
-    ""
   ],
   "email": {
     "transport": "gmail-api"

@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Generic Email Sender Script
-# Usage: ./email_sender.sh [options]
+# Usage: ./mcp_email_sender.sh [options]
 
 # Configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -65,36 +65,38 @@ load_config() {
     echo "📋 Loading configuration from: $config_file"
 
     # Read required + optional fields from JSON
-    EMAIL_SUBJECT=$(jq -r '.EMAIL_SUBJECT // empty' "$config_file")
-    SENDER_EMAIL=$(jq -r '.SENDER_EMAIL // empty' "$config_file")
-    SENDER_NAME=$(jq -r '.SENDER_NAME // empty' "$config_file")
-    HTML_OUTPUT=$(jq -r '.HTML_OUTPUT // empty' "$config_file")
-    PROMPT_FILE=$(jq -r '.PROMPT_FILE // "prompt.txt"' "$config_file")
+    EMAIL_SUBJECT=$(jq -r '.email_subject // .EMAIL_SUBJECT // empty' "$config_file")
+    SENDER_EMAIL=$(jq -r '.sender_email // .SENDER_EMAIL // empty' "$config_file")
+    SENDER_NAME=$(jq -r '.sender_name // .SENDER_NAME // empty' "$config_file")
+    HTML_OUTPUT=$(jq -r '.html_output // .HTML_OUTPUT // empty' "$config_file")
+    PROMPT_FILE=$(jq -r '.prompt_file // .PROMPT_FILE // "prompt.txt"' "$config_file")
 
     # Defaults
     SENDER_EMAIL=${SENDER_EMAIL:-$DEFAULT_SENDER_EMAIL}
     SENDER_NAME=${SENDER_NAME:-$DEFAULT_SENDER_NAME}
     HTML_OUTPUT=${HTML_OUTPUT:-${config_file%.*}.html}
 
-    # Recipients array
-    mapfile -t RECIPIENTS < <(jq -r '.RECIPIENTS[]? // empty' "$config_file")
+    # Recipient lists
+    mapfile -t TO_LIST < <(jq -r '.to[]? // empty' "$config_file")
+    mapfile -t CC_LIST < <(jq -r '.cc[]? // empty' "$config_file")
+    mapfile -t BCC_LIST < <(jq -r '.bcc[]? // empty' "$config_file")
 
     # Validate required variables
     if [[ -z "$EMAIL_SUBJECT" ]]; then
-        echo "❌ Error: EMAIL_SUBJECT not defined in config file"
+        echo "❌ Error: email_subject (or EMAIL_SUBJECT) not defined in config file"
         exit 1
     fi
     
     # Validate prompt file
     if [[ -z "$PROMPT_FILE" || ! -f "$PROMPT_FILE" ]]; then
         echo "❌ Error: Prompt file not found: '${PROMPT_FILE}'"
-        echo "💡 Set 'PROMPT_FILE' in config.json or place 'prompt.txt' in project root."
+        echo "💡 Set 'prompt_file' (or 'PROMPT_FILE') in config.json or place 'prompt.txt' in project root."
         exit 1
     fi
 
     echo "✅ Configuration loaded successfully"
     echo "   Subject: $EMAIL_SUBJECT"
-    echo "   Recipients: ${#RECIPIENTS[@]} addresses"
+    echo "   To: ${#TO_LIST[@]}  Cc: ${#CC_LIST[@]}  Bcc: ${#BCC_LIST[@]}"
     echo "   Output file: $HTML_OUTPUT"
     echo "   Prompt file: $PROMPT_FILE"
 }
@@ -204,19 +206,22 @@ send_email() {
     echo "📧 Preparing to send email..."
     echo "Subject: $EMAIL_SUBJECT"
     echo "From: $SENDER_NAME <$SENDER_EMAIL>"
-    echo "To: $SENDER_EMAIL (sender)"
-    echo "BCC Recipients: ${#RECIPIENTS[@]} addresses"
+    echo "To: ${#TO_LIST[@]} | Cc: ${#CC_LIST[@]} | Bcc: ${#BCC_LIST[@]}"
     echo
     
-    # Show recipient list
-    echo "📋 BCC Recipient List:"
-    for i in "${!RECIPIENTS[@]}"; do
-        echo "  $((i+1)). ${RECIPIENTS[i]}"
-    done
+    # Show recipient list and validate
+    if [[ ${#TO_LIST[@]} -eq 0 && ${#CC_LIST[@]} -eq 0 && ${#BCC_LIST[@]} -eq 0 ]]; then
+        echo "❌ Error: No recipients configured (to/cc/bcc all empty)"
+        exit 1
+    fi
+    echo "📋 Recipient List:"
+    for i in "${!TO_LIST[@]}"; do echo "  To[$((i+1))]: ${TO_LIST[i]}"; done
+    for i in "${!CC_LIST[@]}"; do echo "  Cc[$((i+1))]: ${CC_LIST[i]}"; done
+    for i in "${!BCC_LIST[@]}"; do echo "  Bcc[$((i+1))]: ${BCC_LIST[i]}"; done
     echo
     
     # Confirmation prompt
-    read -p "⚠️  Do you want to send this email to all BCC recipients? (y/N): " confirm
+    read -p "⚠️  Do you want to send this email to the listed recipients? (y/N): " confirm
     
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
         echo "❌ Email sending cancelled."
@@ -226,9 +231,8 @@ send_email() {
     # Read HTML content
     html_content=$(cat "$html_file")
     
-    echo "🚀 Sending email with BCC recipients..."
-    echo "  📤 To: $SENDER_EMAIL"
-    echo "  📤 BCC: ${#RECIPIENTS[@]} recipients (hidden)"
+    echo "🚀 Sending email..."
+    echo "  📤 To: ${#TO_LIST[@]} | Cc: ${#CC_LIST[@]} | Bcc: ${#BCC_LIST[@]}"
     
     # Send email using Claude MCP Gmail integration
     echo "📡 Calling Gmail MCP service..."
@@ -236,18 +240,25 @@ send_email() {
     # Create a temporary file for the MCP call
     temp_json=$(mktemp)
     
-    # Prepare BCC list
-    bcc_json=""
-    for i in "${!RECIPIENTS[@]}"; do
-        if [[ $i -gt 0 ]]; then
-            bcc_json+=","
-        fi
-        bcc_json+="\"${RECIPIENTS[i]}\""
+    # Prepare recipient lists
+    to_json=""; cc_json=""; bcc_json=""
+    for i in "${!TO_LIST[@]}"; do
+        if [[ $i -gt 0 ]]; then to_json+=","; fi
+        to_json+="\"${TO_LIST[i]}\""
+    done
+    for i in "${!CC_LIST[@]}"; do
+        if [[ $i -gt 0 ]]; then cc_json+=","; fi
+        cc_json+="\"${CC_LIST[i]}\""
+    done
+    for i in "${!BCC_LIST[@]}"; do
+        if [[ $i -gt 0 ]]; then bcc_json+=","; fi
+        bcc_json+="\"${BCC_LIST[i]}\""
     done
     
     cat > "$temp_json" << EOF
 {
-    "to": ["$SENDER_EMAIL"],
+    "to": [$to_json],
+    "cc": [$cc_json],
     "bcc": [$bcc_json],
     "subject": "$EMAIL_SUBJECT",
     "htmlBody": $(echo "$html_content" | jq -Rs .),
@@ -278,8 +289,9 @@ EOF
             echo "  ❌ Error: MCP call failed. Please check authentication."
             echo "  💡 Make sure you're authenticated with Gmail via Claude MCP"
             echo "  📋 You can manually send with these parameters:"
-            echo "      To: $SENDER_EMAIL"
-            echo "      BCC: $(IFS=','; echo "${RECIPIENTS[*]}")"
+            echo "      To: $(IFS=','; echo "${TO_LIST[*]}")"
+            echo "      Cc: $(IFS=','; echo "${CC_LIST[*]}")"
+            echo "      Bcc: $(IFS=','; echo "${BCC_LIST[*]}")"
             echo "      Subject: $EMAIL_SUBJECT"
             echo "      HTML Body: [content from $html_file]"
             rm -f "$temp_json"
@@ -296,20 +308,18 @@ EOF
     rm -f "$temp_json"
     
     echo "✅ Email sending process completed!"
-    echo "📊 Summary: 1 email sent with ${#RECIPIENTS[@]} BCC recipients"
-    echo "🔒 Privacy: Recipient emails are hidden from each other"
+    echo "📊 Summary: Email sent"
 }
 
 # Function to validate recipients
 validate_recipients() {
     local invalid_emails=()
-    
-    for email in "${RECIPIENTS[@]}"; do
-        if [[ ! "$email" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]; then
+    local all=("${TO_LIST[@]}" "${CC_LIST[@]}" "${BCC_LIST[@]}")
+    for email in "${all[@]}"; do
+        if [[ -n "$email" && ! "$email" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]; then
             invalid_emails+=("$email")
         fi
     done
-    
     if [[ ${#invalid_emails[@]} -gt 0 ]]; then
         echo "⚠️  Warning: Invalid email addresses found:"
         for email in "${invalid_emails[@]}"; do

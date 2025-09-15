@@ -1,0 +1,143 @@
+How to Implement AI Agents in Agent Land
+========================================
+
+Purpose
+- Give developers a concise, practical playbook to build agents modeled after this project: clearly scoped flows, observable state, REST control plane, and Human‑in‑the‑Loop (HITL) integrations.
+
+1) Agent Objectives And Flow Design
+- Define the objective: Be explicit about input, work, and output. Example: “Generate an HTML email and send it to to/cc/bcc.” That’s two logical steps: generate → send.
+- Decompose into steps: Identify state transitions and artifacts at each step. For email, produce `artifacts/email.html` in generate; produce a send ID in send.
+- Choose sync vs async: For potentially long operations, expose async variants that activate instance state and return early while work continues in background.
+- Capture state visibly:
+  - `status`: active | finished | abort
+  - `started_at`, `finished_at`, `last_error`, `last_html_path`, `last_send_id`
+  - `progress`: array of [timestamp, message]
+  - Store these in a per‑instance `meta.json` co‑located with artifacts and logs.
+
+2) Instance Layout And Conventions
+- Instance directory (recommended for production):
+  - config.json: Instance configuration (see Config section below)
+  - prompt.txt: Prompt content for content generation
+  - meta.json: State document (status, progress, job fields)
+  - logs/run.log: Per‑instance log for debugging and auditing
+  - artifacts/: Outputs, e.g. `artifacts/email.html`, and `artifacts/tmp/` for temp files
+- Server uses AGENT_FOLDER + instance_id to locate the instance directory.
+
+3) REST API Surface
+- Health: `GET /health`
+- Generate: `POST /api/email-agent/generate`
+  - Body: `instance_id?`, `promptText?`, `promptFile?`, `instructions?`, `htmlPath? | sourceHtmlPath?`, `htmlOutput?`, async?, optional LLM overrides.
+  - Output: on success, `{ htmlPath }` or `{ accepted: true, ... }` for async.
+- Send: `POST /api/email-agent/send`
+  - Body: `instance_id?`, `htmlPath? | html?`, `subject?`, `senderEmail?`, `senderName?`, async?
+  - Requires recipients in config via `to`/`cc`/`bcc` (at least one non‑empty). If none, returns `no_recipients_configured`.
+- Generate+Send: `POST /api/email-agent/generate-send`
+  - Combines both; same params as above; supports async.
+- Status: `GET /api/email-agent/status?instance_id=...`
+  - Returns `meta.json` contents for observability and job control.
+- Progress (latest): `GET /api/email-agent/progress?instance_id=...`
+  - Returns `{ instance_id, latest: [timestamp, message] | null }`.
+- Progress (all): `GET /api/email-agent/progress-all?instance_id=...`
+  - Returns `{ instance_id, progress: [[ts, msg], ...] }`.
+
+Patterns for REST APIs
+- Accept JSON bodies; limit size and validate types early.
+- Provide async mode: initialize `meta.json` with `status: active` and return `202 Accepted` with a status URL.
+- Background work: use a safe task runner (e.g., setImmediate/queue) and update `meta.json` at key milestones.
+
+4) Config And Environment
+- Config (per instance, lower‑case preferred, upper‑case tolerated):
+  - email_subject, sender_email, sender_name
+  - prompt_file, html_output
+  - to, cc, bcc: arrays of emails; at least one must be set
+  - human‑in‑the‑loop / HITL section (see HITL below)
+- Environment:
+  - AGENT_FOLDER: Parent directory for instance folders (required when using instance_id)
+  - PORT: HTTP port (default 3001)
+  - LLM_PROVIDER, LLM_MODEL, LLM_ENDPOINT, LLM_OPTIONS (JSON string)
+  - LOG_API_URL: External observability endpoint (optional)
+  - HITL_API_URL: Absolute URL or path; if a path (e.g., `/api/hitl-agent`), the server calls `http://127.0.0.1:<HITL_API_PORT || PORT>`
+  - HITL_API_PORT: Port used when HITL_API_URL is a path
+  - HITL_MAX_LOOPS: Max cycles for HITL regenerate‑review (default 3)
+  - HITL_MOCK: Enable built‑in dev mock for `/api/hitl-agent` (1/true)
+
+5) Logging And Observability
+- Local log: Always append human‑readable lines to per‑instance `logs/run.log`.
+- Remote log: `agent_log()` optionally POSTs to `LOG_API_URL` for central observability when running in an instance context.
+- Mirror key milestones in both places:
+  - State transitions: `state - active`, `state - finished`, `state - abort`
+  - Progress milestones: `llm generating email`, `writing html output`, `generated html`, `sending emails`, `sent email`
+  - HITL milestones: `awaiting human input (loop N)`, `hitl loop back #N`, `hitl approved`, `hitl rejected`, `hitl input: ...`, `hitl provided input; regenerating html`
+- Tips:
+- Avoid logging large/sensitive blobs to the remote API (keep full prompt/HTML in local logs only).
+- Include `instance_id` in log metadata for traceability.
+
+6) Human‑In‑The‑Loop (HITL)
+- Purpose: Insert human judgment and edits before an agent takes an action (e.g., sending an email).
+- Config requirement (per instance): Add one of these sections to config.json:
+  - `"human-in-the-loop": { "enable": true|false }`
+  - or `"HITL": { "enable": true|false }`
+  - or `"hitl": { "enable": true|false }`
+- Placement in the flow: Before the action step (sending), call the HITL service.
+- Request to HITL: `POST HITL_API_URL`
+  - Body includes: `{ instance_id, html_path?, html?, hitl: <normalized HITL section>, HITL: <raw>, human_in_the_loop: <raw>, loop: <N> }`
+- Response from HITL (normalized):
+  - `status`: one of
+    - `no-hitl`: proceed without blocking
+    - `approve`: proceed (may include `html` or `htmlPath` to override)
+    - `reject`: abort the run
+    - `has-input`: human supplied feedback. Look for `input` or `inputText`
+  - `html`: optional, HTML override to use directly
+  - `htmlPath`: optional, path to HTML override
+  - `input` | `inputText`: optional, human feedback to guide regeneration
+- Handling decisions:
+  - `no-hitl` / `approve`: proceed; apply HTML override if provided
+  - `reject`: set state to `abort`, record `last_error`, stop
+  - `has-input`: append a `[KEY INSTRUCTIONS]` section with the human input to the prompt, regenerate HTML, and loop back to HITL. Log the input even if empty.
+- Looping and limits:
+  - Track loop count in progress/logs: `awaiting human input (loop N)`, `hitl loop back #N`
+  - Limit loops via `HITL_MAX_LOOPS` (default 3); log and proceed/exit appropriately when reached
+- Error policy (based on config `enable`):
+  - `enable: true` → HITL request errors abort the run (update meta to `abort`)
+  - `enable: false` → Attempt HITL, but request errors do not block (proceed and log)
+- Dev mock:
+  - Enable with `HITL_MOCK=1` and POST to `/api/hitl-agent`. Default behavior returns `has-input` on first loop and `approve` afterwards; query overrides supported: `?decision=approve|reject|has-input|no-hitl` and optional `&html=` or `&htmlPath=` for approve.
+
+7) Error Handling And State Model
+- Use `meta.json` as the single source of truth for instance status.
+- On errors, prefer returning specific codes (e.g., `missing_instance_id`, `missing_env_AGENT_FOLDER`, `base_html_not_found`, `no_recipients_configured`, `hitl_rejected`, `hitl_request_failed`, etc.).
+- Always mirror errors to progress/logs for quick triage.
+- In async mode, ensure background tasks set final `status` and `last_error` appropriately.
+
+8) LLM Content Generation Patterns
+- Prompt management:
+  - Use a clean base prompt from `prompt.txt` or inline `promptText`.
+  - Support `instructions` for semantic edits; when present, try to load base HTML (`htmlPath`/`sourceHtmlPath` or default output) and instruct the model to update it.
+  - Wrap outputs in ```html fences if possible; strip the fences before saving.
+- Configurable LLM provider:
+  - Provider, model, endpoint, and options from env
+  - Keep options JSON simple and documented (e.g., temperature, top_k/top_p)
+
+9) Transport/Action Abstraction
+- Separate “generate” from “send/action” so each can be reused independently and tested.
+- Keep action inputs strictly typed: sender info, recipients (to/cc/bcc), subject, payload.
+- Return action identifiers (e.g., send ID) for later auditing.
+
+10) CLI Tooling (Optional)
+- Provide a simple CLI (e.g., `mcp_email_sender.sh`) to run the flow without the server.
+- Keep CLI and server config shape aligned so users can switch between them easily.
+
+11) Security And Secrets
+- Load secrets from `.env`; never commit secrets to version control.
+- Avoid logging sensitive content to remote observability; keep full artifacts in local logs only.
+- Validate and sanitize all external inputs (REST bodies) and file paths.
+
+12) Local Dev And Testing
+- `.env` and dev runner: use a lightweight watcher or restart script for quick iteration.
+- Create instances under `AGENT_FOLDER` and manipulate `meta.json` in place to test status/progress.
+- Use the dev HITL mock to iterate on the HITL loop quickly.
+
+13) Extending An Agent
+- Add new steps: define clear state transitions and progress messages.
+- Extend artifacts: version files (e.g., archive older `email.html`), keep outputs under `artifacts/`.
+- Add transports: implement a new action function per transport (e.g., Slack/Teams) and call it from the flow.
