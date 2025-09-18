@@ -205,6 +205,7 @@ Backward compatibility: Uppercase keys (`EMAIL_SUBJECT`, `SENDER_EMAIL`, `SENDER
 - `GET /api/email-agent/status?instance_id=...` — returns per-instance `meta.json` (status, job info)
 - `GET /api/email-agent/progress?instance_id=...` — returns `{ instance_id, latest: [timestamp, message] | null }`
 - `GET /api/email-agent/progress-all?instance_id=...` — returns `{ instance_id, progress: [[timestamp, message], ...] }`
+- `GET /api/email-agent/wi_response?instance_id=...&respond=approve` — work‑item response; when `respond=approve`, sends the instance's default generated HTML email (`artifacts/email.html`) and returns send id
  - HITL (external): `POST /api/hitl-agent` — not implemented here; expected to accept `{ instance_id, html_path?, html? }` and return e.g. `{ status: "approve" | "reject" | "has-input" | "no-hitl", input?, html?, htmlPath? }`.
 
 ## Port Configuration

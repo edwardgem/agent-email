@@ -369,16 +369,16 @@ async function generateEmailFlow(body, ctxMaybe) {
   agent_log({ message: `completed generating email using LLM (model: ${model})`, config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
   // Progress: writing html output
   if (ctx.paths) {
-    appendProgress(path.join(ctx.paths.root, 'meta.json'), 'writing html output');
-    agent_log({ message: 'writing html output', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
+    appendProgress(path.join(ctx.paths.root, 'meta.json'), 'saving html email to file');
+    agent_log({ message: 'writing html email to file', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
   }
   const htmlOutputRel = resolveOutputPathRel(body, base, ctx);
   const outputPath = absoluteFromMaybeInstance(htmlOutputRel, ctx);
   writeHtmlWithArchive(outputPath, html, ctx.paths ? ctx.paths.runLog : undefined);
   // Progress: generated html
   if (ctx.paths) {
-    appendProgress(path.join(ctx.paths.root, 'meta.json'), 'generated html');
-    agent_log({ message: 'generated html', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
+    appendProgress(path.join(ctx.paths.root, 'meta.json'), 'generated html email');
+    agent_log({ message: 'generated html email', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
   }
   return { html, htmlOutputRel, outputPath, base, ctx };
 }
@@ -472,6 +472,14 @@ async function sendEmailFlow(body, baseMaybe, ctxMaybe, overrideHtml) {
       }
       break;
     }
+    if (status === 'wait-for-human') {
+      if (ctx.paths) {
+        appendProgress(metaPath, 'hitl wait-for-human');
+        agent_log({ message: 'hitl wait-for-human', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
+      }
+      // Exit gracefully without changing state
+      return { halted: 'wait-for-human', ctx, base };
+    }
     if (status === 'reject') {
       if (ctx.paths) {
         appendProgress(metaPath, 'hitl rejected');
@@ -530,12 +538,15 @@ async function sendEmailFlow(body, baseMaybe, ctxMaybe, overrideHtml) {
       // Loop back to HITL review again
       continue;
     }
-    // Unknown status: proceed
+    // Unknown status: abort instance and exit gracefully
     if (ctx.paths) {
-      appendProgress(metaPath, `hitl unknown status: ${status} (proceeding)`);
-      agent_log({ message: `hitl unknown status: ${status} (proceeding)`, config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
+      appendProgress(metaPath, `hitl unknown status: ${status}`);
+      agent_log({ message: `hitl unknown status: ${status}`, config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
+      const err = updateMetaJson(metaPath, 'abort', { last_error: `hitl_unknown_status:${status}` });
+      if (err) agent_log({ message: `meta.json error: ${err}`, config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
+      agent_log({ message: 'state - abort', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
     }
-    break;
+    return { error: 'hitl_unknown_status', ctx, base };
   }
   // Progress: sending emails
   if (ctx.paths) {
@@ -697,6 +708,10 @@ async function handleSend(req, res, body) {
             agent_log({ message: 'state - abort', config: normalizeConfig(base), runLogOverride: paths.runLog });
             return;
           }
+          if (sent.halted === 'wait-for-human') {
+            // Leave as active and exit gracefully
+            return;
+          }
           const metaErr3 = updateMetaJson(metaPath, 'finished', { last_error: null, last_send_id: sent.id });
           if (metaErr3) {
             agent_log({ message: `meta.json error: ${metaErr3}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
@@ -724,6 +739,12 @@ async function handleSend(req, res, body) {
     if (sent.error) {
       res.writeHead(400, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: sent.error }));
+      return;
+    }
+    if (sent.halted === 'wait-for-human') {
+      // Do not change state; remain active
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, status: 'waiting-for-human' }));
       return;
     }
     res.writeHead(200, { 'content-type': 'application/json' });
@@ -799,6 +820,10 @@ async function handleGenerateSend(req, res, body) {
             agent_log({ message: 'state - abort', config: normalizeConfig(base), runLogOverride: paths.runLog });
             return;
           }
+          if (sent.halted === 'wait-for-human') {
+            // Leave as active and exit gracefully
+            return;
+          }
           const metaErr4 = updateMetaJson(metaPath, 'finished', { last_error: null, last_html_path: gen.htmlOutputRel, last_send_id: sent.id });
           if (metaErr4) {
             agent_log({ message: `meta.json error: ${metaErr4}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
@@ -835,6 +860,12 @@ async function handleGenerateSend(req, res, body) {
     if (sent.error) {
       res.writeHead(400, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: sent.error }));
+      return;
+    }
+    if (sent.halted === 'wait-for-human') {
+      // Do not change state; remain active
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, htmlPath: gen.htmlOutputRel, status: 'waiting-for-human' }));
       return;
     }
     res.writeHead(200, { 'content-type': 'application/json' });
@@ -879,6 +910,129 @@ const server = http.createServer(async (req, res) => {
   if (method === 'GET' && parsed.pathname === '/health') {
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ ok: true }));
+    return;
+  }
+
+  // WI response endpoint: handle simple approval/reject of default HTML
+  if (method === 'GET' && parsed.pathname === '/api/email-agent/wi_response') {
+    const instanceId = parsed.query && parsed.query.instance_id;
+    const respond = parsed.query && parsed.query.respond;
+    if (!instanceId) {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'missing_instance_id' }));
+      return;
+    }
+    if (!respond) {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'missing_respond_param' }));
+      return;
+    }
+    try {
+      const body = { instance_id: instanceId };
+      const ctx = resolveContext(body, { activate: false });
+      if (ctx.error) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: ctx.error }));
+        return;
+      }
+      const base = ctx.base;
+      // Log receiving the WI response API call
+      agent_log({ message: `receive API call: wi response - ${respond}`, config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
+
+      if (respond === 'approve') {
+        // Log the WI approval decision
+        agent_log({ message: 'wi response - approve', config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
+        const sent = await sendEmailFlow(body, base, ctx);
+        if (sent && sent.error) {
+          res.writeHead(400, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: sent.error }));
+          return;
+        }
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, id: sent.id }));
+        // finalize state for instances (also logs 'state - finished')
+        if (ctx.paths) {
+          const metaPath = path.join(ctx.paths.root, 'meta.json');
+          const metaErr = updateMetaJson(metaPath, 'finished');
+          if (metaErr) {
+            agent_log({ message: `meta.json error: ${metaErr}`, config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
+            agent_log({ message: 'state - abort', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
+            return;
+          }
+          agent_log({ message: 'state - finished', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
+        } else {
+          agent_log({ message: 'state - finished', config: normalizeConfig(base) });
+        }
+        return;
+      }
+
+      if (respond === 'modify') {
+        const info = (parsed.query && parsed.query.info) ? String(parsed.query.info) : '';
+        if (!info) {
+          res.writeHead(400, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'missing_info' }));
+          return;
+        }
+        // Log the WI modify decision
+        agent_log({ message: 'wi response - modify', config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
+        // Generate with additional user instructions, then send
+        const gen = await generateEmailFlow({ ...body, instructions: info }, ctx);
+        if (gen.error) {
+          res.writeHead(400, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: gen.error }));
+          return;
+        }
+        if (gen.errorObj) {
+          res.writeHead(400, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: gen.errorObj.code, path: gen.errorObj.path }));
+          return;
+        }
+        const sent = await sendEmailFlow(body, gen.base, gen.ctx, gen.html);
+        if (sent.error) {
+          res.writeHead(400, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: sent.error }));
+          return;
+        }
+        if (sent.halted === 'wait-for-human') {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, status: 'waiting-for-human' }));
+          // NOTE: Do not change instance state here; remain 'active'.
+          return;
+        }
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, id: sent.id }));
+        // NOTE: Do not change instance state here; remain 'active'.
+        return;
+      }
+
+      if (respond === 'reject') {
+        // Log the WI rejection and set state to abort
+        agent_log({ message: 'wi response - reject', config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
+        if (ctx.paths) {
+          const metaPath = path.join(ctx.paths.root, 'meta.json');
+          const metaErr = updateMetaJson(metaPath, 'abort');
+          if (metaErr) {
+            agent_log({ message: `meta.json error: ${metaErr}`, config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
+            res.writeHead(500, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ error: metaErr }));
+            return;
+          }
+          agent_log({ message: 'state - abort', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
+        } else {
+          agent_log({ message: 'state - abort', config: normalizeConfig(base) });
+        }
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, status: 'abort' }));
+        return;
+      }
+
+      // Unknown respond value
+      res.writeHead(501, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'respond_not_implemented', respond }));
+    } catch (e) {
+      res.writeHead(500, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: e.stack || e.message }));
+    }
     return;
   }
 
@@ -1012,6 +1166,16 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ error: 'invalid_json' }));
       return;
     }
+    // Log receipt of API call per endpoint
+    try {
+      const ctx = resolveContext(body, { activate: false });
+      const base = ctx && ctx.base ? ctx.base : {};
+      let label = 'unknown';
+      if (parsed.pathname === '/api/email-agent/generate') label = 'generate';
+      else if (parsed.pathname === '/api/email-agent/send') label = 'send';
+      else if (parsed.pathname === '/api/email-agent/generate-send') label = 'generate-send';
+      agent_log({ message: `receive API call: ${label}`, config: normalizeConfig(base), runLogOverride: ctx && ctx.paths ? ctx.paths.runLog : undefined });
+    } catch (_) { /* ignore logging errors */ }
 
     if (parsed.pathname === '/api/email-agent/generate') return handleGenerate(req, res, body);
     if (parsed.pathname === '/api/email-agent/send') return handleSend(req, res, body);
