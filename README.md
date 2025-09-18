@@ -174,15 +174,15 @@ Backward compatibility: Uppercase keys (`EMAIL_SUBJECT`, `SENDER_EMAIL`, `SENDER
 - Human-in-the-loop (HITL): Before sending, the agent calls a HITL endpoint to get a decision.
   - Configure `HITL_API_URL` in `.env` (e.g., `HITL_API_URL=http://localhost:4001/api/hitl-agent`). If you set only a path like `/api/hitl-agent`, it will default to the current server port.
   - Request body includes: `{ instance_id, html_path?, html?, hitl: <instance HITL config>, HITL: <raw HITL section>, human_in_the_loop: <raw human-in-the-loop section>, loop: <current loop index> }`.
-  - HITL decisions supported: `no-hitl` (proceed) or `wait-for-response` (pause and keep the instance active; the API returns `waiting-for-response`).
+  - HITL decisions supported: `no-hitl` (proceed), `wait-for-response` (pause and keep the instance active; the API returns `waiting-for-response`), or `active` (treated the same as `wait-for-response`).
   - Error policy: If the instance config’s `human-in-the-loop.enable` or `HITL.enable` is true, a HITL error aborts the run; otherwise the agent proceeds (still logs the error).
   - Config requirement: For instance runs, your `config.json` must include a HITL section under one of these keys: `"human-in-the-loop"`, `"HITL"`, or `"hitl"`. If missing, the run aborts with error `missing_hitl_config_section`.
-  - Dev mock: You can enable a built-in mock endpoint by setting `HITL_MOCK=1` in `.env`. It exposes `POST /api/hitl-agent` directly on this server. Default behavior returns `{ status: "no-hitl" }`. You can override via query `?decision=no-hitl|wait-for-response`.
+  - Dev mock: You can enable a built-in mock endpoint by setting `HITL_MOCK=1` in `.env`. It exposes `POST /api/hitl-agent` directly on this server. Default behavior returns `{ status: "no-hitl" }`. You can override via query `?decision=no-hitl|wait-for-response|active`.
 
 Async flow with HITL
 - The server makes a single POST to the HITL endpoint and expects 200 OK with a JSON body containing `status`.
 - If `status` is `no-hitl`, the server proceeds to send the email.
-- If `status` is `wait-for-response`, the server stops contacting HITL and leaves the run active:
+- If `status` is `wait-for-response` or `active`, the server stops contacting HITL and leaves the run active:
   - Sync requests respond with `200 { ok: true, status: 'waiting-for-response' }`.
   - Async requests return `202 Accepted` initially; the background job exits early, leaving the instance status as `active`.
 - To resume, your HITL system (or a human tool) must call the WI callback endpoint on this server:
@@ -217,6 +217,7 @@ Async flow with HITL
 - `GET /api/email-agent/progress-all?instance_id=...` — returns `{ instance_id, progress: [[timestamp, message], ...] }`
 - `GET /api/email-agent/wi_response?instance_id=...&respond=approve` — work‑item response; when `respond=approve`, sends the instance's default generated HTML email (`artifacts/email.html`) and returns send id
  - HITL (external): `POST /api/hitl-agent` — expected to accept `{ instance_id, html_path?, html? }` and return `{ status: "no-hitl" | "wait-for-response" }`.
+ - Note: The HITL endpoint may also return `{ status: \"active\" }`, which the server treats the same as `\"wait-for-response\"`.
 
 ## Port Configuration
 - The default port is 3001. You can override it by setting the `PORT` environment variable:

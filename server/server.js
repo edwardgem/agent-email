@@ -339,7 +339,8 @@ async function callHitlAgent({ instanceId, htmlPath, html, ctx, base, loopIndex 
     const input = data && (data.input || data.inputText || data.instructions || data.note || '');
     const htmlOverride = data && (data.html || data.html_content);
     const htmlPathOverride = data && (data.htmlPath || data.html_path);
-    return { status, input, htmlOverride, htmlPathOverride };
+    const information = data && data.information;
+    return { status, input, htmlOverride, htmlPathOverride, information };
   } catch (e) {
     return { error: `hitl_request_failed: ${e.message}` };
   }
@@ -427,6 +428,16 @@ async function sendEmailFlow(body, baseMaybe, ctxMaybe, overrideHtml) {
       agent_log({ message: 'awaiting hitl response', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
     }
     const decision = await callHitlAgent({ instanceId, htmlPath, html, ctx, base, loopIndex: 0 });
+    // Log optional informational message from HITL response
+    if (decision && decision.information) {
+      const infoMsg = String(decision.information);
+      if (ctx.paths) {
+        appendProgress(metaPath, `hitl information: ${infoMsg}`);
+        agent_log({ message: `hitl information: ${infoMsg}`, config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
+      } else {
+        agent_log({ message: `hitl information: ${infoMsg}`, config: normalizeConfig(base) });
+      }
+    }
     if (decision && decision.error) {
       if (ctx.paths) {
         appendProgress(metaPath, `hitl error: ${decision.error}`);
@@ -456,7 +467,8 @@ async function sendEmailFlow(body, baseMaybe, ctxMaybe, overrideHtml) {
       }
       // continue to send
     }
-    if (status === 'wait-for-response') {
+    // Accept both 'wait-for-response' and 'active' as pause-and-wait indicators
+    if (status === 'wait-for-response' || status === 'active') {
       if (ctx.paths) {
         appendProgress(metaPath, 'hitl wait-for-response');
         agent_log({ message: 'hitl wait-for-response', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
