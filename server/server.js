@@ -400,6 +400,7 @@ async function sendEmailFlow(body, baseMaybe, ctxMaybe, overrideHtml) {
       return { error: msg, ctx, base };
     }
   }
+  const skipHitl = !!(body && body.skipHitl);
   let htmlPath = body.htmlPath;
   if (!htmlPath && body.html) htmlPath = materializeHtmlForSend(body, ctx);
   if (!htmlPath && ctx.paths && ctx.paths.artifacts) htmlPath = path.join(ctx.paths.artifacts, 'email.html');
@@ -415,7 +416,7 @@ async function sendEmailFlow(body, baseMaybe, ctxMaybe, overrideHtml) {
   }
   appendLogLocal(`[PROGRESS] Sending email. to=${toFinal.join(', ')} cc=${ccFinal.join(', ')} bcc=${bccFinal.join(', ')}`,
     ctx.paths ? ctx.paths.runLog : undefined);
-  // HITL review loop before sending
+  // HITL review loop before sending (unless explicitly skipped by caller)
   // Enforces presence of a HITL config for instance runs and executes a
   // request → decision → optional regenerate → loop cycle.
   const instanceId = getInstanceIdFromCtx(ctx);
@@ -423,7 +424,7 @@ async function sendEmailFlow(body, baseMaybe, ctxMaybe, overrideHtml) {
   let loops = 0;
   const maxLoops = Number(process.env.HITL_MAX_LOOPS || 3);
   const hitlEnabled = !!getHitlConfig(base).enable;
-  while (true) {
+  if (!skipHitl) while (true) {
     // Call HITL agent
     if (ctx.paths) {
       const loopMsg = loops === 0 ? 'awaiting human input' : `awaiting human input (loop ${loops})`;
@@ -547,6 +548,10 @@ async function sendEmailFlow(body, baseMaybe, ctxMaybe, overrideHtml) {
       agent_log({ message: 'state - abort', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
     }
     return { error: 'hitl_unknown_status', ctx, base };
+  }
+  if (skipHitl && ctx.paths) {
+    appendProgress(path.join(ctx.paths.root, 'meta.json'), 'hitl skipped');
+    agent_log({ message: 'hitl skipped', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
   }
   // Progress: sending emails
   if (ctx.paths) {
@@ -942,7 +947,7 @@ const server = http.createServer(async (req, res) => {
       if (respond === 'approve') {
         // Log the WI approval decision
         agent_log({ message: 'wi response - approve', config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
-        const sent = await sendEmailFlow(body, base, ctx);
+        const sent = await sendEmailFlow({ ...body, skipHitl: true }, base, ctx);
         if (sent && sent.error) {
           res.writeHead(400, { 'content-type': 'application/json' });
           res.end(JSON.stringify({ error: sent.error }));
