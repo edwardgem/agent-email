@@ -542,9 +542,9 @@ async function sendEmailFlow(body, baseMaybe, ctxMaybe, overrideHtml) {
     // Unknown status: abort instance and exit gracefully
     if (ctx.paths) {
       appendProgress(metaPath, `hitl unknown status: ${status}`);
-      agent_log({ message: `hitl unknown status: ${status}`, config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
+      agent_log({ message: `hitl unknown status: ${status}`, level: 'error', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
       const err = updateMetaJson(metaPath, 'abort', { last_error: `hitl_unknown_status:${status}` });
-      if (err) agent_log({ message: `meta.json error: ${err}`, config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
+      if (err) agent_log({ message: `meta.json error: ${err}`, level: 'error', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
       agent_log({ message: 'state - abort', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
     }
     return { error: 'hitl_unknown_status', ctx, base };
