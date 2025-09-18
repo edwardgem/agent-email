@@ -171,14 +171,25 @@ Backward compatibility: Uppercase keys (`EMAIL_SUBJECT`, `SENDER_EMAIL`, `SENDER
    - Local logs always include full details (including full prompts and HTML content).
    - The REST logging at `LOG_API_URL` captures state and key events for observability; it does not include full prompt/HTML content.
   - Progress events are mirrored to logging: each progress update (llm generating email, writing html output, generated html, sending emails, sent email) is also emitted via `agent_log` and, for per-instance runs, POSTed to `LOG_API_URL`.
-- Human-in-the-loop (HITL): Before sending, the agent calls a HITL endpoint to get a decision and optional input.
+- Human-in-the-loop (HITL): Before sending, the agent calls a HITL endpoint to get a decision.
   - Configure `HITL_API_URL` in `.env` (e.g., `HITL_API_URL=http://localhost:4001/api/hitl-agent`). If you set only a path like `/api/hitl-agent`, it will default to the current server port.
   - Request body includes: `{ instance_id, html_path?, html?, hitl: <instance HITL config>, HITL: <raw HITL section>, human_in_the_loop: <raw human-in-the-loop section>, loop: <current loop index> }`.
-  - HITL decisions supported: `no-hitl` (proceed), `approve` (proceed, optionally using returned `html` or `htmlPath`), `reject` (set status to `abort` and stop), `has-input` (append the `input`/`inputText` under `[KEY INSTRUCTIONS]` and regenerate HTML, then re-check HITL; limited by `HITL_MAX_LOOPS`, default 3).
+  - HITL decisions supported: `no-hitl` (proceed) or `wait-for-response` (pause and keep the instance active; the API returns `waiting-for-response`).
   - Error policy: If the instance config’s `human-in-the-loop.enable` or `HITL.enable` is true, a HITL error aborts the run; otherwise the agent proceeds (still logs the error).
-  - Looping: Each loop back is logged and recorded in progress with the loop number; HITL input text is logged to progress/agent log even if empty.
   - Config requirement: For instance runs, your `config.json` must include a HITL section under one of these keys: `"human-in-the-loop"`, `"HITL"`, or `"hitl"`. If missing, the run aborts with error `missing_hitl_config_section`.
-  - Dev mock: You can enable a built-in mock endpoint by setting `HITL_MOCK=1` in `.env`. It exposes `POST /api/hitl-agent` directly on this server. Default behavior: first call returns `{ status: "has-input", inputText: "Please add a clear CTA button and a P.S. line." }`, subsequent loops return `{ status: "approve" }`. You can override via query `?decision=approve|reject|has-input|no-hitl` and optional `&html=...` or `&htmlPath=...` when approving.
+  - Dev mock: You can enable a built-in mock endpoint by setting `HITL_MOCK=1` in `.env`. It exposes `POST /api/hitl-agent` directly on this server. Default behavior returns `{ status: "no-hitl" }`. You can override via query `?decision=no-hitl|wait-for-response`.
+
+Async flow with HITL
+- The server makes a single POST to the HITL endpoint and expects 200 OK with a JSON body containing `status`.
+- If `status` is `no-hitl`, the server proceeds to send the email.
+- If `status` is `wait-for-response`, the server stops contacting HITL and leaves the run active:
+  - Sync requests respond with `200 { ok: true, status: 'waiting-for-response' }`.
+  - Async requests return `202 Accepted` initially; the background job exits early, leaving the instance status as `active`.
+- To resume, your HITL system (or a human tool) must call the WI callback endpoint on this server:
+  - `GET /api/email-agent/wi_response?instance_id=...&respond=approve|modify|reject`
+    - `approve` — sends the default generated HTML (`artifacts/email.html`) and finalizes the run.
+    - `modify&info=...` — regenerates HTML with the supplied info; stays active (you can call again to approve/reject later).
+    - `reject` — aborts the run.
 - Temporary prompt files are written to `outputs/tmp/` (global) or `artifacts/tmp/` (per-instance).
 - meta.json in each instance folder tracks agent state.
 
@@ -188,7 +199,6 @@ Backward compatibility: Uppercase keys (`EMAIL_SUBJECT`, `SENDER_EMAIL`, `SENDER
  - HITL settings:
    - `HITL_API_URL`: Absolute URL (e.g., `http://localhost:4000/api/hitl-agent`) or path (e.g., `/api/hitl-agent`). If path, the server will call `http://127.0.0.1:<HITL_API_PORT || PORT || 3001>`.
    - `HITL_API_PORT`: Optional port to use when `HITL_API_URL` is a path.
-   - `HITL_MAX_LOOPS`: Optional max cycles for regenerate-review (default 3).
 
 ## LLM Configuration
 - Configure LLM via environment only (no config.json keys):
@@ -206,7 +216,7 @@ Backward compatibility: Uppercase keys (`EMAIL_SUBJECT`, `SENDER_EMAIL`, `SENDER
 - `GET /api/email-agent/progress?instance_id=...` — returns `{ instance_id, latest: [timestamp, message] | null }`
 - `GET /api/email-agent/progress-all?instance_id=...` — returns `{ instance_id, progress: [[timestamp, message], ...] }`
 - `GET /api/email-agent/wi_response?instance_id=...&respond=approve` — work‑item response; when `respond=approve`, sends the instance's default generated HTML email (`artifacts/email.html`) and returns send id
- - HITL (external): `POST /api/hitl-agent` — not implemented here; expected to accept `{ instance_id, html_path?, html? }` and return e.g. `{ status: "approve" | "reject" | "has-input" | "no-hitl", input?, html?, htmlPath? }`.
+ - HITL (external): `POST /api/hitl-agent` — expected to accept `{ instance_id, html_path?, html? }` and return `{ status: "no-hitl" | "wait-for-response" }`.
 
 ## Port Configuration
 - The default port is 3001. You can override it by setting the `PORT` environment variable:

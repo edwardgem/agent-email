@@ -324,9 +324,7 @@ function getHitlConfig(base) {
  * Call the configured HITL REST endpoint with current context.
  * Expects a JSON response with one of the statuses:
  *  - no-hitl: proceed without blocking
- *  - approve: proceed (optionally with html/htmlPath overrides)
- *  - reject: abort the run
- *  - has-input: use provided input/inputText to regenerate, then re-check
+ *  - wait-for-response: pause and wait for WI callback
  */
 async function callHitlAgent({ instanceId, htmlPath, html, ctx, base, loopIndex }) {
   const url = getHitlApiUrl();
@@ -416,26 +414,19 @@ async function sendEmailFlow(body, baseMaybe, ctxMaybe, overrideHtml) {
   }
   appendLogLocal(`[PROGRESS] Sending email. to=${toFinal.join(', ')} cc=${ccFinal.join(', ')} bcc=${bccFinal.join(', ')}`,
     ctx.paths ? ctx.paths.runLog : undefined);
-  // HITL review loop before sending (unless explicitly skipped by caller)
+  // HITL check before sending (unless explicitly skipped by caller)
   // Enforces presence of a HITL config for instance runs and executes a
-  // request → decision → optional regenerate → loop cycle.
+  // single request → decision.
   const instanceId = getInstanceIdFromCtx(ctx);
   const metaPath = ctx.paths ? path.join(ctx.paths.root, 'meta.json') : undefined;
-  let loops = 0;
-  const maxLoops = Number(process.env.HITL_MAX_LOOPS || 3);
   const hitlEnabled = !!getHitlConfig(base).enable;
-  if (!skipHitl) while (true) {
+  if (!skipHitl) {
     // Call HITL agent
     if (ctx.paths) {
-      const loopMsg = loops === 0 ? 'awaiting human input' : `awaiting human input (loop ${loops})`;
-      appendProgress(metaPath, loopMsg);
-      agent_log({ message: loopMsg, config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
+      appendProgress(metaPath, 'awaiting hitl response');
+      agent_log({ message: 'awaiting hitl response', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
     }
-    if (ctx.paths && loops > 0) {
-      appendProgress(metaPath, `hitl loop back #${loops}`);
-      agent_log({ message: `hitl loop back #${loops}`, config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
-    }
-    const decision = await callHitlAgent({ instanceId, htmlPath, html, ctx, base, loopIndex: loops });
+    const decision = await callHitlAgent({ instanceId, htmlPath, html, ctx, base, loopIndex: 0 });
     if (decision && decision.error) {
       if (ctx.paths) {
         appendProgress(metaPath, `hitl error: ${decision.error}`);
@@ -454,90 +445,24 @@ async function sendEmailFlow(body, baseMaybe, ctxMaybe, overrideHtml) {
           appendProgress(metaPath, 'hitl error (proceeding without block)');
           agent_log({ message: 'hitl error (proceeding without block)', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
         }
-        break;
+        // continue to send
       }
     }
     const status = (decision && decision.status) || 'no-hitl';
-    if (status === 'no-hitl' || status === 'approve') {
-      // Use override HTML if provided by HITL
-      if (decision && decision.htmlOverride) {
-        html = String(decision.htmlOverride);
-      } else if (decision && decision.htmlPathOverride) {
-        const p = absoluteFromMaybeInstance(decision.htmlPathOverride, ctx);
-        if (fs.existsSync(p)) html = fs.readFileSync(p, 'utf8');
-        htmlPath = decision.htmlPathOverride;
-      }
+    if (status === 'no-hitl') {
       if (ctx.paths) {
-        appendProgress(metaPath, 'hitl approved');
-        agent_log({ message: 'hitl approved', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
+        appendProgress(metaPath, 'hitl proceed');
+        agent_log({ message: 'hitl proceed', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
       }
-      break;
+      // continue to send
     }
-    if (status === 'wait-for-human') {
+    if (status === 'wait-for-response') {
       if (ctx.paths) {
-        appendProgress(metaPath, 'hitl wait-for-human');
-        agent_log({ message: 'hitl wait-for-human', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
+        appendProgress(metaPath, 'hitl wait-for-response');
+        agent_log({ message: 'hitl wait-for-response', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
       }
       // Exit gracefully without changing state
-      return { halted: 'wait-for-human', ctx, base };
-    }
-    if (status === 'reject') {
-      if (ctx.paths) {
-        appendProgress(metaPath, 'hitl rejected');
-        agent_log({ message: 'hitl rejected', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
-        const err = updateMetaJson(metaPath, 'abort', { last_error: 'hitl_rejected' });
-        if (err) agent_log({ message: `meta.json error: ${err}`, config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
-        agent_log({ message: 'state - abort', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
-      }
-      return { error: 'hitl_rejected', ctx, base };
-    }
-    if (status === 'has-input') {
-      const extraRaw = (decision && (decision.input || decision.inputText || ''));
-      const extra = String(extraRaw == null ? '' : extraRaw).trim();
-      if (ctx.paths) {
-        appendProgress(metaPath, `hitl input: ${extra}`);
-        agent_log({ message: `hitl input: ${extra}`, config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
-      }
-      if (!extra) {
-        // No extra input, treat as approve
-        if (ctx.paths) {
-          appendProgress(metaPath, 'hitl approve (empty input)');
-          agent_log({ message: 'hitl approve (empty input)', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
-        }
-        break;
-      }
-      // Regenerate HTML with extra instructions
-      if (ctx.paths) {
-        appendProgress(metaPath, 'hitl provided input; regenerating html');
-        agent_log({ message: 'hitl provided input; regenerating html', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
-      }
-      const regenBody = { ...body, instructions: extra, // append via KEY INSTRUCTIONS
-        // preserve any model/provider settings already passed
-        provider: body.provider, model: body.model, endpoint: body.endpoint, options: body.options };
-      const regen = await generateEmailFlow(regenBody, ctx);
-      if (regen.error || regen.errorObj) {
-        const errMsg = regen.error || (regen.errorObj && regen.errorObj.code) || 'hitl_regen_failed';
-        if (ctx.paths) {
-          appendProgress(metaPath, `hitl regen error: ${errMsg}`);
-          agent_log({ message: `hitl regen error: ${errMsg}`, config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
-          const err = updateMetaJson(metaPath, 'abort', { last_error: errMsg });
-          if (err) agent_log({ message: `meta.json error: ${err}`, config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
-          agent_log({ message: 'state - abort', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
-        }
-        return { error: errMsg, ctx, base };
-      }
-      html = regen.html;
-      htmlPath = regen.htmlOutputRel;
-      loops += 1;
-      if (loops >= maxLoops) {
-        if (ctx.paths) {
-          appendProgress(metaPath, 'hitl loop limit reached');
-          agent_log({ message: 'hitl loop limit reached', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
-        }
-        break;
-      }
-      // Loop back to HITL review again
-      continue;
+      return { halted: 'wait-for-response', ctx, base };
     }
     // Unknown status: abort instance and exit gracefully
     if (ctx.paths) {
@@ -713,7 +638,7 @@ async function handleSend(req, res, body) {
             agent_log({ message: 'state - abort', config: normalizeConfig(base), runLogOverride: paths.runLog });
             return;
           }
-          if (sent.halted === 'wait-for-human') {
+          if (sent.halted === 'wait-for-response') {
             // Leave as active and exit gracefully
             return;
           }
@@ -746,10 +671,10 @@ async function handleSend(req, res, body) {
       res.end(JSON.stringify({ error: sent.error }));
       return;
     }
-    if (sent.halted === 'wait-for-human') {
+    if (sent.halted === 'wait-for-response') {
       // Do not change state; remain active
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, status: 'waiting-for-human' }));
+      res.end(JSON.stringify({ ok: true, status: 'waiting-for-response' }));
       return;
     }
     res.writeHead(200, { 'content-type': 'application/json' });
@@ -825,7 +750,7 @@ async function handleGenerateSend(req, res, body) {
             agent_log({ message: 'state - abort', config: normalizeConfig(base), runLogOverride: paths.runLog });
             return;
           }
-          if (sent.halted === 'wait-for-human') {
+          if (sent.halted === 'wait-for-response') {
             // Leave as active and exit gracefully
             return;
           }
@@ -867,10 +792,10 @@ async function handleGenerateSend(req, res, body) {
       res.end(JSON.stringify({ error: sent.error }));
       return;
     }
-    if (sent.halted === 'wait-for-human') {
+    if (sent.halted === 'wait-for-response') {
       // Do not change state; remain active
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, htmlPath: gen.htmlOutputRel, status: 'waiting-for-human' }));
+      res.end(JSON.stringify({ ok: true, htmlPath: gen.htmlOutputRel, status: 'waiting-for-response' }));
       return;
     }
     res.writeHead(200, { 'content-type': 'application/json' });
@@ -1010,9 +935,9 @@ const server = http.createServer(async (req, res) => {
           res.end(JSON.stringify({ error: sent.error }));
           return;
         }
-        if (sent.halted === 'wait-for-human') {
+        if (sent.halted === 'wait-for-response') {
           res.writeHead(200, { 'content-type': 'application/json' });
-          res.end(JSON.stringify({ ok: true, status: 'waiting-for-human' }));
+          res.end(JSON.stringify({ ok: true, status: 'waiting-for-response' }));
           // NOTE: Do not change instance state here; remain 'active'.
           return;
         }
@@ -1067,23 +992,10 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ error: 'invalid_json' }));
       return;
     }
-    // Optional query overrides: ?decision=approve|reject|has-input|no-hitl
+    // Optional query overrides: ?decision=no-hitl|wait-for-response
     const decisionOverride = parsed.query && (parsed.query.decision || parsed.query.status);
-    const htmlOverride = parsed.query && parsed.query.html;
-    const htmlPathOverride = parsed.query && parsed.query.htmlPath;
-    const loop = Number(body.loop || 0);
-    const decision = (decisionOverride && String(decisionOverride))
-      || (loop < 1 ? 'has-input' : 'approve');
-    // Default input for has-input; echo through if provided
-    const inputText = Object.prototype.hasOwnProperty.call(body, 'input') ? body.input
-      : (Object.prototype.hasOwnProperty.call(body, 'inputText') ? body.inputText
-      : 'Please add a clear CTA button and a P.S. line.');
+    const decision = (decisionOverride && String(decisionOverride)) || 'no-hitl';
     const resp = { status: decision };
-    if (decision === 'has-input') resp.inputText = inputText || '';
-    if (decision === 'approve') {
-      if (htmlOverride) resp.html = htmlOverride;
-      if (htmlPathOverride) resp.htmlPath = htmlPathOverride;
-    }
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify(resp));
     return;
