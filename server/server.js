@@ -943,6 +943,18 @@ const server = http.createServer(async (req, res) => {
       const base = ctx.base;
       // Log receiving the WI response API call
       agent_log({ message: `receive API call: wi response - ${respond}`, config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
+      // Progress log for WI response receipt
+      const metaPath = ctx.paths ? path.join(ctx.paths.root, 'meta.json') : undefined;
+      const wiMsg = `receive call from agent work item processing, response=${respond}`;
+      if (metaPath) appendProgress(metaPath, wiMsg);
+      agent_log({ message: wiMsg, config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
+      // If info is present, log it too
+      const infoMaybe = parsed.query && parsed.query.info;
+      if (infoMaybe != null && String(infoMaybe).trim() !== '') {
+        const infoMsg = `wi response info: ${String(infoMaybe)}`;
+        if (metaPath) appendProgress(metaPath, infoMsg);
+        agent_log({ message: infoMsg, config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
+      }
 
       if (respond === 'approve') {
         // Log the WI approval decision
