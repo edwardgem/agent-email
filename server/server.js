@@ -329,10 +329,30 @@ function getHitlConfig(base) {
 async function callHitlAgent({ instanceId, htmlPath, html, ctx, base, loopIndex }) {
   const url = getHitlApiUrl();
   const hitlCfg = getHitlConfig(base);
-  const payload = { instance_id: instanceId, html_path: htmlPath, html, hitl: hitlCfg, HITL: base && base['HITL'], human_in_the_loop: base && base['human-in-the-loop'], loop: loopIndex };
+  const payload = { caller_id: instanceId, html_path: htmlPath, html, hitl: hitlCfg, HITL: base && base['HITL'], human_in_the_loop: base && base['human-in-the-loop'], loop: loopIndex };
   try {
     const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-    if (!res.ok) return { error: `hitl_http_${res.status}` };
+    if (!res.ok) {
+      // Try to extract error details and information from the response body
+      try {
+        const ctype = (res.headers && res.headers.get && res.headers.get('content-type')) || '';
+        if (ctype.includes('application/json')) {
+          const j = await res.json();
+          const errMsg = j.error || j.message || `HTTP ${res.status}`;
+          const status = j.status || j.decision || j.result;
+          const input = j.input || j.inputText || j.instructions || j.note || '';
+          const htmlOverride = j.html || j.html_content;
+          const htmlPathOverride = j.htmlPath || j.html_path;
+          const information = j.information || j.info || j.details;
+          return { error: `hitl_http_${res.status}: ${errMsg}`, status, input, htmlOverride, htmlPathOverride, information };
+        } else {
+          const text = await res.text();
+          return { error: `hitl_http_${res.status}: ${text}` };
+        }
+      } catch (e) {
+        return { error: `hitl_http_${res.status}: ${e.message}` };
+      }
+    }
     const data = await res.json();
     // Normalize fields
     const status = (data && (data.status || data.decision || data.result)) || 'no-hitl';
@@ -369,7 +389,8 @@ async function generateEmailFlow(body, ctxMaybe) {
   // Progress: writing html output
   if (ctx.paths) {
     appendProgress(path.join(ctx.paths.root, 'meta.json'), 'saving html email to file');
-    agent_log({ message: 'writing html email to file', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
+    // Log locally for the instance instead of agent_log
+    appendLogLocal('writing html email to file', ctx.paths.runLog);
   }
   const htmlOutputRel = resolveOutputPathRel(body, base, ctx);
   const outputPath = absoluteFromMaybeInstance(htmlOutputRel, ctx);
@@ -442,6 +463,8 @@ async function sendEmailFlow(body, baseMaybe, ctxMaybe, overrideHtml) {
       if (ctx.paths) {
         appendProgress(metaPath, `hitl error: ${decision.error}`);
         agent_log({ message: `hitl error: ${decision.error}`, config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
+      } else {
+        agent_log({ message: `hitl error: ${decision.error}`, config: normalizeConfig(base) });
       }
       if (hitlEnabled) {
         if (ctx.paths) {
@@ -855,10 +878,26 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // WI response endpoint: handle simple approval/reject of default HTML
-  if (method === 'GET' && parsed.pathname === '/api/email-agent/wi_response') {
-    const instanceId = parsed.query && parsed.query.instance_id;
-    const respond = parsed.query && parsed.query.respond;
+  // Enforce method on hitl-callback path: only POST and OPTIONS allowed
+  if (parsed.pathname === '/api/email-agent/hitl-callback' && !(method === 'POST' || method === 'OPTIONS')) {
+    res.writeHead(405, { 'content-type': 'application/json', 'Allow': 'POST, OPTIONS' });
+    res.end(JSON.stringify({ error: 'method_not_allowed' }));
+    return;
+  }
+
+
+  // HITL callback endpoint (POST): handle approval/modify/reject for an instance
+  if (method === 'POST' && parsed.pathname === '/api/email-agent/hitl-callback') {
+    let body = {};
+    try { body = await readJsonBody(req); } catch (e) {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'invalid_json' }));
+      return;
+    }
+    const instanceId = body && body.instance_id;
+    // New param names: response, information. Backward compat: respond, info.
+    const respond = body && (body.response || body.respond);
+    const info = body && (body.information || body.info) ? String(body.information || body.info) : '';
     if (!instanceId) {
       res.writeHead(400, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: 'missing_instance_id' }));
@@ -866,12 +905,11 @@ const server = http.createServer(async (req, res) => {
     }
     if (!respond) {
       res.writeHead(400, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ error: 'missing_respond_param' }));
+      res.end(JSON.stringify({ error: 'missing_response_param' }));
       return;
     }
     try {
-      const body = { instance_id: instanceId };
-      const ctx = resolveContext(body, { activate: false });
+      const ctx = resolveContext({ instance_id: instanceId }, { activate: false });
       if (ctx.error) {
         res.writeHead(400, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ error: ctx.error }));
@@ -885,10 +923,9 @@ const server = http.createServer(async (req, res) => {
       const wiMsg = `receive call from agent work item processing, response=${respond}`;
       if (metaPath) appendProgress(metaPath, wiMsg);
       agent_log({ message: wiMsg, config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
-      // If info is present, log it too
-      const infoMaybe = parsed.query && parsed.query.info;
-      if (infoMaybe != null && String(infoMaybe).trim() !== '') {
-        const infoMsg = `wi response info: ${String(infoMaybe)}`;
+      // If information is present, log it too
+      if (info) {
+        const infoMsg = `wi response info: ${info}`;
         if (metaPath) appendProgress(metaPath, infoMsg);
         agent_log({ message: infoMsg, config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
       }
@@ -896,7 +933,7 @@ const server = http.createServer(async (req, res) => {
       if (respond === 'approve') {
         // Log the WI approval decision
         agent_log({ message: 'wi response - approve', config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
-        const sent = await sendEmailFlow({ ...body, skipHitl: true }, base, ctx);
+        const sent = await sendEmailFlow({ instance_id: instanceId, skipHitl: true }, base, ctx);
         if (sent && sent.error) {
           res.writeHead(400, { 'content-type': 'application/json' });
           res.end(JSON.stringify({ error: sent.error }));
@@ -917,20 +954,21 @@ const server = http.createServer(async (req, res) => {
         } else {
           agent_log({ message: 'state - finished', config: normalizeConfig(base) });
         }
+        // Finish marker for HITL workitem processing (approve)
+        agent_log({ message: 'finish processing HITL workitem response of approve', config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
         return;
       }
 
       if (respond === 'modify') {
-        const info = (parsed.query && parsed.query.info) ? String(parsed.query.info) : '';
         if (!info) {
           res.writeHead(400, { 'content-type': 'application/json' });
-          res.end(JSON.stringify({ error: 'missing_info' }));
+          res.end(JSON.stringify({ error: 'missing_information' }));
           return;
         }
         // Log the WI modify decision
         agent_log({ message: 'wi response - modify', config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
         // Generate with additional user instructions, then send
-        const gen = await generateEmailFlow({ ...body, instructions: info }, ctx);
+        const gen = await generateEmailFlow({ instance_id: instanceId, instructions: info }, ctx);
         if (gen.error) {
           res.writeHead(400, { 'content-type': 'application/json' });
           res.end(JSON.stringify({ error: gen.error }));
@@ -941,7 +979,7 @@ const server = http.createServer(async (req, res) => {
           res.end(JSON.stringify({ error: gen.errorObj.code, path: gen.errorObj.path }));
           return;
         }
-        const sent = await sendEmailFlow(body, gen.base, gen.ctx, gen.html);
+        const sent = await sendEmailFlow({ instance_id: instanceId }, gen.base, gen.ctx, gen.html);
         if (sent.error) {
           res.writeHead(400, { 'content-type': 'application/json' });
           res.end(JSON.stringify({ error: sent.error }));
@@ -951,17 +989,27 @@ const server = http.createServer(async (req, res) => {
           res.writeHead(200, { 'content-type': 'application/json' });
           res.end(JSON.stringify({ ok: true, status: 'waiting-for-response' }));
           // NOTE: Do not change instance state here; remain 'active'.
+          // Finish marker for HITL workitem processing (modify)
+          agent_log({ message: 'finish processing HITL workitem response of modify', config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
           return;
         }
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ ok: true, id: sent.id }));
         // NOTE: Do not change instance state here; remain 'active'.
+        // Finish marker for HITL workitem processing (modify)
+        agent_log({ message: 'finish processing HITL workitem response of modify', config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
         return;
       }
 
       if (respond === 'reject') {
+        if (!info) {
+          res.writeHead(400, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'missing_information' }));
+          return;
+        }
         // Log the WI rejection and set state to abort
         agent_log({ message: 'wi response - reject', config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
+        if (metaPath) appendProgress(metaPath, `reject reason: ${info}`);
         if (ctx.paths) {
           const metaPath = path.join(ctx.paths.root, 'meta.json');
           const metaErr = updateMetaJson(metaPath, 'abort');
@@ -977,12 +1025,14 @@ const server = http.createServer(async (req, res) => {
         }
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ ok: true, status: 'abort' }));
+        // Finish marker for HITL workitem processing (reject)
+        agent_log({ message: 'finish processing HITL workitem response of reject', config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
         return;
       }
 
       // Unknown respond value
       res.writeHead(501, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ error: 'respond_not_implemented', respond }));
+      res.end(JSON.stringify({ error: 'response_not_implemented', response: respond }));
     } catch (e) {
       res.writeHead(500, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: e.stack || e.message }));

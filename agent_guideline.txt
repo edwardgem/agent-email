@@ -80,7 +80,7 @@ Patterns for REST APIs
   - or `"hitl": { "enable": true|false }`
 - Placement in the flow: Before the action step (sending), call the HITL service.
 - Request to HITL: `POST HITL_API_URL`
-  - Body includes: `{ instance_id, html_path?, html?, hitl: <normalized HITL section>, HITL: <raw>, human_in_the_loop: <raw>, loop: <N> }`
+  - Body includes: `{ caller_id, html_path?, html?, hitl: <normalized HITL section>, HITL: <raw>, human_in_the_loop: <raw>, loop: <N> }`
 - Response from HITL (normalized):
   - `status`: one of
     - `no-hitl`: proceed without blocking
