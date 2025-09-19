@@ -84,6 +84,19 @@ fs.mkdirSync(OUTPUTS_DIR, { recursive: true });
 fs.mkdirSync(TMP_DIR, { recursive: true });
 fs.mkdirSync(LOG_DIR, { recursive: true });
 
+// Summarize info text to a limited number of words (default 8)
+function summarizeInfoText(text, maxWords = 8) {
+  try {
+    if (!text) return '';
+    const words = String(text).trim().split(/\s+/).filter(Boolean);
+    if (!words.length) return '';
+    const clipped = words.slice(0, maxWords).join(' ');
+    return clipped + (words.length > maxWords ? ' ...' : '');
+  } catch (_) {
+    return '';
+  }
+}
+
 function appendLog(lines) {
   const stamp = new Date().toISOString();
   const text = Array.isArray(lines) ? lines.join('\n') : String(lines);
@@ -382,7 +395,8 @@ async function generateEmailFlow(body, ctxMaybe) {
   // Progress: LLM generating email
   if (ctx.paths) {
     appendProgress(path.join(ctx.paths.root, 'meta.json'), 'llm generating email');
-    agent_log({ message: 'llm generating email', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
+    // Log locally for the instance instead of agent_log (no remote)
+    appendLogLocal('llm generating email', ctx.paths.runLog);
   }
   const { html } = await generateHtml({ provider, model, endpoint, prompt: prep.prompt, options });
   agent_log({ message: `completed generating email using LLM (model: ${model})`, config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
@@ -446,7 +460,8 @@ async function sendEmailFlow(body, baseMaybe, ctxMaybe, overrideHtml) {
     // Call HITL agent
     if (ctx.paths) {
       appendProgress(metaPath, 'awaiting hitl response');
-      agent_log({ message: 'awaiting hitl response', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
+      // Log locally for the instance instead of agent_log (no remote)
+      appendLogLocal('awaiting hitl response', ctx.paths.runLog);
     }
     const decision = await callHitlAgent({ instanceId, htmlPath, html, ctx, base, loopIndex: 0 });
     // Log optional informational message from HITL response
@@ -494,7 +509,8 @@ async function sendEmailFlow(body, baseMaybe, ctxMaybe, overrideHtml) {
     if (status === 'wait-for-response' || status === 'active') {
       if (ctx.paths) {
         appendProgress(metaPath, 'hitl wait-for-response');
-        agent_log({ message: 'hitl wait-for-response', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
+        // Log locally for the instance instead of agent_log (no remote)
+        appendLogLocal('hitl wait-for-response', ctx.paths.runLog);
       }
       // Exit gracefully without changing state
       return { halted: 'wait-for-response', ctx, base };
@@ -511,7 +527,6 @@ async function sendEmailFlow(body, baseMaybe, ctxMaybe, overrideHtml) {
   }
   if (skipHitl && ctx.paths) {
     appendProgress(path.join(ctx.paths.root, 'meta.json'), 'hitl skipped');
-    agent_log({ message: 'hitl skipped', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
   }
   // Progress: sending emails
   if (ctx.paths) {
@@ -519,7 +534,6 @@ async function sendEmailFlow(body, baseMaybe, ctxMaybe, overrideHtml) {
     agent_log({ message: 'sending emails', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
   }
   const data = await sendEmail({ fromName, fromEmail, to: toFinal.length ? toFinal : [fromEmail], cc: ccFinal, bcc: bccFinal, subject, html });
-  agent_log({ message: `completed sending email to ${toFinal.length + ccFinal.length + bccFinal.length} recipients`, config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
   // Progress: sent email
   if (ctx.paths) {
     appendProgress(path.join(ctx.paths.root, 'meta.json'), 'sent email');
@@ -560,6 +574,7 @@ async function handleGenerate(req, res, body) {
       const statusUrl = `/api/email-agent/status?instance_id=${encodeURIComponent(body.instance_id)}`;
       res.writeHead(202, { 'content-type': 'application/json', Location: statusUrl });
       res.end(JSON.stringify({ accepted: true, status: 'active', instance_id: body.instance_id, links: { status: statusUrl } }));
+      try { console.log(`[HTTP 202] ${req.url} - async generate accepted for instance ${body.instance_id}`); } catch (_) {}
       // Background task
       setImmediate(async () => {
         try {
@@ -607,6 +622,7 @@ async function handleGenerate(req, res, body) {
     }
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ htmlPath: gen.htmlOutputRel, html: gen.html }));
+    try { console.log(`[HTTP 200] ${req.url} - generate completed`); } catch (_) {}
   } catch (e) {
     res.writeHead(500, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ error: e.message }));
@@ -662,6 +678,7 @@ async function handleSend(req, res, body) {
       const statusUrl = `/api/email-agent/status?instance_id=${encodeURIComponent(body.instance_id)}`;
       res.writeHead(202, { 'content-type': 'application/json', Location: statusUrl });
       res.end(JSON.stringify({ accepted: true, status: 'active', instance_id: body.instance_id, links: { status: statusUrl } }));
+      try { console.log(`[HTTP 202] ${req.url} - async send accepted for instance ${body.instance_id}`); } catch (_) {}
       setImmediate(async () => {
         try {
           const ctx = { paths, base };
@@ -710,10 +727,12 @@ async function handleSend(req, res, body) {
       // Do not change state; remain active
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ ok: true, status: 'waiting-for-response' }));
+      try { console.log(`[HTTP 200] ${req.url} - send waiting-for-response`); } catch (_) {}
       return;
     }
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ ok: true, id: sent.id }));
+    try { console.log(`[HTTP 200] ${req.url} - send completed (id=${sent.id})`); } catch (_) {}
     // finalize state
     if (ctx.paths) {
       const metaPath = path.join(ctx.paths.root, 'meta.json');
@@ -765,6 +784,7 @@ async function handleGenerateSend(req, res, body) {
       const statusUrl = `/api/email-agent/status?instance_id=${encodeURIComponent(body.instance_id)}`;
       res.writeHead(202, { 'content-type': 'application/json', Location: statusUrl });
       res.end(JSON.stringify({ accepted: true, status: 'active', instance_id: body.instance_id, links: { status: statusUrl } }));
+      try { console.log(`[HTTP 202] ${req.url} - async generate-send accepted for instance ${body.instance_id}`); } catch (_) {}
       setImmediate(async () => {
         try {
           const ctx = { paths, base };
@@ -831,10 +851,12 @@ async function handleGenerateSend(req, res, body) {
       // Do not change state; remain active
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ ok: true, htmlPath: gen.htmlOutputRel, status: 'waiting-for-response' }));
+      try { console.log(`[HTTP 200] ${req.url} - generate-send waiting-for-response`); } catch (_) {}
       return;
     }
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ ok: true, htmlPath: gen.htmlOutputRel, id: sent.id }));
+    try { console.log(`[HTTP 200] ${req.url} - generate-send completed (id=${sent.id})`); } catch (_) {}
     // finalize state for instances
     if (gen.ctx && gen.ctx.paths) {
       const metaPath = path.join(gen.ctx.paths.root, 'meta.json');
@@ -875,6 +897,7 @@ const server = http.createServer(async (req, res) => {
   if (method === 'GET' && parsed.pathname === '/health') {
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ ok: true }));
+    try { console.log(`[HTTP 200] ${req.url} - health ok`); } catch (_) {}
     return;
   }
 
@@ -916,23 +939,14 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       const base = ctx.base;
-      // Log receiving the WI response API call
-      agent_log({ message: `receive API call: wi response - ${respond}`, config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
-      // Progress log for WI response receipt
+      // Log receipt of WI response and include a concise info snippet when present
       const metaPath = ctx.paths ? path.join(ctx.paths.root, 'meta.json') : undefined;
-      const wiMsg = `receive call from agent work item processing, response=${respond}`;
-      if (metaPath) appendProgress(metaPath, wiMsg);
+      const infoSuffix = info && info.trim() ? `, info=${summarizeInfoText(info)}` : '';
+      const wiMsg = `receive call from agent work item processing, response=${respond}${infoSuffix}`;
       agent_log({ message: wiMsg, config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
-      // If information is present, log it too
-      if (info) {
-        const infoMsg = `wi response info: ${info}`;
-        if (metaPath) appendProgress(metaPath, infoMsg);
-        agent_log({ message: infoMsg, config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
-      }
 
       if (respond === 'approve') {
-        // Log the WI approval decision
-        agent_log({ message: 'wi response - approve', config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
+        // Avoid noisy agent_log for 'wi response - approve'
         const sent = await sendEmailFlow({ instance_id: instanceId, skipHitl: true }, base, ctx);
         if (sent && sent.error) {
           res.writeHead(400, { 'content-type': 'application/json' });
@@ -941,6 +955,7 @@ const server = http.createServer(async (req, res) => {
         }
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ ok: true, id: sent.id }));
+        try { console.log(`[HTTP 200] ${req.url} - hitl approve completed (id=${sent.id})`); } catch (_) {}
         // finalize state for instances (also logs 'state - finished')
         if (ctx.paths) {
           const metaPath = path.join(ctx.paths.root, 'meta.json');
@@ -955,7 +970,11 @@ const server = http.createServer(async (req, res) => {
           agent_log({ message: 'state - finished', config: normalizeConfig(base) });
         }
         // Finish marker for HITL workitem processing (approve)
-        agent_log({ message: 'finish processing HITL workitem response of approve', config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
+        {
+          const infoSuffix = info && info.trim() ? `, information: ${summarizeInfoText(info)}` : '';
+          agent_log({ message: `finish processing HITL workitem response of approve${infoSuffix}`,
+            config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
+        }
         return;
       }
 
@@ -965,39 +984,47 @@ const server = http.createServer(async (req, res) => {
           res.end(JSON.stringify({ error: 'missing_information' }));
           return;
         }
-        // Log the WI modify decision
-        agent_log({ message: 'wi response - modify', config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
-        // Generate with additional user instructions, then send
-        const gen = await generateEmailFlow({ instance_id: instanceId, instructions: info }, ctx);
-        if (gen.error) {
-          res.writeHead(400, { 'content-type': 'application/json' });
-          res.end(JSON.stringify({ error: gen.error }));
-          return;
-        }
-        if (gen.errorObj) {
-          res.writeHead(400, { 'content-type': 'application/json' });
-          res.end(JSON.stringify({ error: gen.errorObj.code, path: gen.errorObj.path }));
-          return;
-        }
-        const sent = await sendEmailFlow({ instance_id: instanceId }, gen.base, gen.ctx, gen.html);
-        if (sent.error) {
-          res.writeHead(400, { 'content-type': 'application/json' });
-          res.end(JSON.stringify({ error: sent.error }));
-          return;
-        }
-        if (sent.halted === 'wait-for-response') {
-          res.writeHead(200, { 'content-type': 'application/json' });
-          res.end(JSON.stringify({ ok: true, status: 'waiting-for-response' }));
-          // NOTE: Do not change instance state here; remain 'active'.
-          // Finish marker for HITL workitem processing (modify)
-          agent_log({ message: 'finish processing HITL workitem response of modify', config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
-          return;
-        }
-        res.writeHead(200, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, id: sent.id }));
-        // NOTE: Do not change instance state here; remain 'active'.
-        // Finish marker for HITL workitem processing (modify)
-        agent_log({ message: 'finish processing HITL workitem response of modify', config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
+        // Respond quickly and process in background to avoid long waits
+        const statusUrl = `/api/email-agent/status?instance_id=${encodeURIComponent(instanceId)}`;
+        res.writeHead(202, { 'content-type': 'application/json', Location: statusUrl });
+        res.end(JSON.stringify({ accepted: true, status: 'processing', action: 'modify', instance_id: instanceId, links: { status: statusUrl } }));
+        try { console.log(`[HTTP 202] ${req.url} - hitl modify accepted for instance ${instanceId}`); } catch (_) {}
+
+        // Background job: generate with user instructions and then send
+        setImmediate(async () => {
+          try {
+            // Generate with additional user instructions, then send
+            const gen = await generateEmailFlow({ instance_id: instanceId, instructions: info }, ctx);
+            if (gen.error || gen.errorObj) {
+              const errMsg = gen.error || (gen.errorObj && `${gen.errorObj.code}${gen.errorObj.path ? ` (${gen.errorObj.path})` : ''}`) || 'unknown_error';
+              agent_log({ message: `modify flow error: ${errMsg}`,
+                config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
+              // Keep instance active; do not change state on modify errors
+              return;
+            }
+            const sent = await sendEmailFlow({ instance_id: instanceId }, gen.base, gen.ctx, gen.html);
+            if (sent && sent.error) {
+              agent_log({ message: `modify send error: ${sent.error}`,
+                config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
+              // Keep instance active; do not change state on modify errors
+              return;
+            }
+            if (sent && sent.halted === 'wait-for-response') {
+              // NOTE: Do not change instance state here; remain 'active'.
+              const infoSuffix = info && info.trim() ? `, information: ${summarizeInfoText(info)}` : '';
+              agent_log({ message: `finish processing HITL workitem response of modify${infoSuffix}`,
+                config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
+              return;
+            }
+            // Success path; remain active after modify
+            const infoSuffix = info && info.trim() ? `, information: ${summarizeInfoText(info)}` : '';
+            agent_log({ message: `finish processing HITL workitem response of modify${infoSuffix}`,
+              config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
+          } catch (e) {
+            agent_log({ message: `modify flow exception: ${e.stack || e.message}`,
+              config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
+          }
+        });
         return;
       }
 
@@ -1007,8 +1034,7 @@ const server = http.createServer(async (req, res) => {
           res.end(JSON.stringify({ error: 'missing_information' }));
           return;
         }
-        // Log the WI rejection and set state to abort
-        agent_log({ message: 'wi response - reject', config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
+        // Avoid noisy agent_log for 'wi response - reject'; set state to abort
         if (metaPath) appendProgress(metaPath, `reject reason: ${info}`);
         if (ctx.paths) {
           const metaPath = path.join(ctx.paths.root, 'meta.json');
@@ -1025,8 +1051,13 @@ const server = http.createServer(async (req, res) => {
         }
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ ok: true, status: 'abort' }));
+        try { console.log(`[HTTP 200] ${req.url} - hitl reject acknowledged`); } catch (_) {}
         // Finish marker for HITL workitem processing (reject)
-        agent_log({ message: 'finish processing HITL workitem response of reject', config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
+        {
+          const infoSuffix = info && info.trim() ? `, information: ${summarizeInfoText(info)}` : '';
+          agent_log({ message: `finish processing HITL workitem response of reject${infoSuffix}`,
+            config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
+        }
         return;
       }
 
@@ -1060,6 +1091,7 @@ const server = http.createServer(async (req, res) => {
     const resp = { status: decision };
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify(resp));
+    try { console.log(`[HTTP 200] ${req.url} - hitl mock responded`); } catch (_) {}
     return;
   }
 
@@ -1084,6 +1116,7 @@ const server = http.createServer(async (req, res) => {
       const meta = JSON.parse(raw);
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ instance_id: instanceId, ...meta }));
+      try { console.log(`[HTTP 200] ${req.url} - status delivered for ${instanceId}`); } catch (_) {}
     } catch (e) {
       res.writeHead(404, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: `meta_not_found_or_invalid: ${e.message}` }));
@@ -1114,6 +1147,7 @@ const server = http.createServer(async (req, res) => {
       const latest = progress.length ? progress[progress.length - 1] : null;
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ instance_id: instanceId, latest }));
+      try { console.log(`[HTTP 200] ${req.url} - progress latest delivered for ${instanceId}`); } catch (_) {}
     } catch (e) {
       res.writeHead(404, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: `meta_not_found_or_invalid: ${e.message}` }));
@@ -1143,6 +1177,7 @@ const server = http.createServer(async (req, res) => {
       const progress = Array.isArray(meta.progress) ? meta.progress : [];
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ instance_id: instanceId, progress }));
+      try { console.log(`[HTTP 200] ${req.url} - progress-all delivered for ${instanceId}`); } catch (_) {}
     } catch (e) {
       res.writeHead(404, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: `meta_not_found_or_invalid: ${e.message}` }));

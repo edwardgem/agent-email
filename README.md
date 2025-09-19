@@ -192,7 +192,7 @@ Backward compatibility: Uppercase keys (`EMAIL_SUBJECT`, `SENDER_EMAIL`, `SENDER
  - Logs are written to `logs/run.log` (global) and per-instance `logs/run.log`.
    - Local logs always include full details (including full prompts and HTML content).
    - The REST logging at `LOG_API_URL` captures state and key events for observability; it does not include full prompt/HTML content.
-  - Progress events are mirrored to logging: each progress update (llm generating email, writing html output, generated html, sending emails, sent email) is also emitted via `agent_log` and, for per-instance runs, POSTed to `LOG_API_URL`.
+  - Progress events are mirrored to logging. For most events we emit via `agent_log` (and POST to `LOG_API_URL` for per‑instance runs). However, the following are logged locally only (no `agent_log`/remote): `llm generating email`, `awaiting hitl response`, and `hitl wait-for-response`.
 - Human-in-the-loop (HITL): See “HITL Processing” for configuration and the request/response flow.
 - Temporary prompt files are written to `outputs/tmp/` (global) or `artifacts/tmp/` (per-instance).
 - meta.json in each instance folder tracks agent state.
