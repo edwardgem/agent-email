@@ -527,17 +527,20 @@ async function sendEmailFlow(body, baseMaybe, ctxMaybe, overrideHtml) {
   }
   if (skipHitl && ctx.paths) {
     appendProgress(path.join(ctx.paths.root, 'meta.json'), 'hitl skipped');
+    agent_log({
+      message: 'skip HITL - processing just returned from work item',
+      config: normalizeConfig(base),
+      runLogOverride: ctx.paths.runLog
+    });
   }
   // Progress: sending emails
   if (ctx.paths) {
     appendProgress(path.join(ctx.paths.root, 'meta.json'), 'sending emails');
-    agent_log({ message: 'sending emails', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
   }
   const data = await sendEmail({ fromName, fromEmail, to: toFinal.length ? toFinal : [fromEmail], cc: ccFinal, bcc: bccFinal, subject, html });
   // Progress: sent email
   if (ctx.paths) {
     appendProgress(path.join(ctx.paths.root, 'meta.json'), 'sent email');
-    agent_log({ message: 'sent email', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
   }
   return { id: data.id, ctx, base };
 }
@@ -574,7 +577,6 @@ async function handleGenerate(req, res, body) {
       const statusUrl = `/api/email-agent/status?instance_id=${encodeURIComponent(body.instance_id)}`;
       res.writeHead(202, { 'content-type': 'application/json', Location: statusUrl });
       res.end(JSON.stringify({ accepted: true, status: 'active', instance_id: body.instance_id, links: { status: statusUrl } }));
-      try { console.log(`[HTTP 202] ${req.url} - async generate accepted for instance ${body.instance_id}`); } catch (_) {}
       // Background task
       setImmediate(async () => {
         try {
@@ -622,7 +624,6 @@ async function handleGenerate(req, res, body) {
     }
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ htmlPath: gen.htmlOutputRel, html: gen.html }));
-    try { console.log(`[HTTP 200] ${req.url} - generate completed`); } catch (_) {}
   } catch (e) {
     res.writeHead(500, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ error: e.message }));
@@ -678,7 +679,6 @@ async function handleSend(req, res, body) {
       const statusUrl = `/api/email-agent/status?instance_id=${encodeURIComponent(body.instance_id)}`;
       res.writeHead(202, { 'content-type': 'application/json', Location: statusUrl });
       res.end(JSON.stringify({ accepted: true, status: 'active', instance_id: body.instance_id, links: { status: statusUrl } }));
-      try { console.log(`[HTTP 202] ${req.url} - async send accepted for instance ${body.instance_id}`); } catch (_) {}
       setImmediate(async () => {
         try {
           const ctx = { paths, base };
@@ -727,12 +727,10 @@ async function handleSend(req, res, body) {
       // Do not change state; remain active
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ ok: true, status: 'waiting-for-response' }));
-      try { console.log(`[HTTP 200] ${req.url} - send waiting-for-response`); } catch (_) {}
       return;
     }
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ ok: true, id: sent.id }));
-    try { console.log(`[HTTP 200] ${req.url} - send completed (id=${sent.id})`); } catch (_) {}
     // finalize state
     if (ctx.paths) {
       const metaPath = path.join(ctx.paths.root, 'meta.json');
@@ -784,7 +782,6 @@ async function handleGenerateSend(req, res, body) {
       const statusUrl = `/api/email-agent/status?instance_id=${encodeURIComponent(body.instance_id)}`;
       res.writeHead(202, { 'content-type': 'application/json', Location: statusUrl });
       res.end(JSON.stringify({ accepted: true, status: 'active', instance_id: body.instance_id, links: { status: statusUrl } }));
-      try { console.log(`[HTTP 202] ${req.url} - async generate-send accepted for instance ${body.instance_id}`); } catch (_) {}
       setImmediate(async () => {
         try {
           const ctx = { paths, base };
@@ -851,12 +848,10 @@ async function handleGenerateSend(req, res, body) {
       // Do not change state; remain active
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ ok: true, htmlPath: gen.htmlOutputRel, status: 'waiting-for-response' }));
-      try { console.log(`[HTTP 200] ${req.url} - generate-send waiting-for-response`); } catch (_) {}
       return;
     }
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ ok: true, htmlPath: gen.htmlOutputRel, id: sent.id }));
-    try { console.log(`[HTTP 200] ${req.url} - generate-send completed (id=${sent.id})`); } catch (_) {}
     // finalize state for instances
     if (gen.ctx && gen.ctx.paths) {
       const metaPath = path.join(gen.ctx.paths.root, 'meta.json');
@@ -897,7 +892,6 @@ const server = http.createServer(async (req, res) => {
   if (method === 'GET' && parsed.pathname === '/health') {
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ ok: true }));
-    try { console.log(`[HTTP 200] ${req.url} - health ok`); } catch (_) {}
     return;
   }
 
@@ -955,7 +949,6 @@ const server = http.createServer(async (req, res) => {
         }
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ ok: true, id: sent.id }));
-        try { console.log(`[HTTP 200] ${req.url} - hitl approve completed (id=${sent.id})`); } catch (_) {}
         // finalize state for instances (also logs 'state - finished')
         if (ctx.paths) {
           const metaPath = path.join(ctx.paths.root, 'meta.json');
@@ -988,7 +981,6 @@ const server = http.createServer(async (req, res) => {
         const statusUrl = `/api/email-agent/status?instance_id=${encodeURIComponent(instanceId)}`;
         res.writeHead(202, { 'content-type': 'application/json', Location: statusUrl });
         res.end(JSON.stringify({ accepted: true, status: 'processing', action: 'modify', instance_id: instanceId, links: { status: statusUrl } }));
-        try { console.log(`[HTTP 202] ${req.url} - hitl modify accepted for instance ${instanceId}`); } catch (_) {}
 
         // Background job: generate with user instructions and then send
         setImmediate(async () => {
@@ -1051,7 +1043,6 @@ const server = http.createServer(async (req, res) => {
         }
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ ok: true, status: 'abort' }));
-        try { console.log(`[HTTP 200] ${req.url} - hitl reject acknowledged`); } catch (_) {}
         // Finish marker for HITL workitem processing (reject)
         {
           const infoSuffix = info && info.trim() ? `, information: ${summarizeInfoText(info)}` : '';
@@ -1091,7 +1082,6 @@ const server = http.createServer(async (req, res) => {
     const resp = { status: decision };
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify(resp));
-    try { console.log(`[HTTP 200] ${req.url} - hitl mock responded`); } catch (_) {}
     return;
   }
 
@@ -1116,7 +1106,6 @@ const server = http.createServer(async (req, res) => {
       const meta = JSON.parse(raw);
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ instance_id: instanceId, ...meta }));
-      try { console.log(`[HTTP 200] ${req.url} - status delivered for ${instanceId}`); } catch (_) {}
     } catch (e) {
       res.writeHead(404, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: `meta_not_found_or_invalid: ${e.message}` }));
@@ -1147,7 +1136,6 @@ const server = http.createServer(async (req, res) => {
       const latest = progress.length ? progress[progress.length - 1] : null;
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ instance_id: instanceId, latest }));
-      try { console.log(`[HTTP 200] ${req.url} - progress latest delivered for ${instanceId}`); } catch (_) {}
     } catch (e) {
       res.writeHead(404, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: `meta_not_found_or_invalid: ${e.message}` }));
@@ -1177,7 +1165,6 @@ const server = http.createServer(async (req, res) => {
       const progress = Array.isArray(meta.progress) ? meta.progress : [];
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ instance_id: instanceId, progress }));
-      try { console.log(`[HTTP 200] ${req.url} - progress-all delivered for ${instanceId}`); } catch (_) {}
     } catch (e) {
       res.writeHead(404, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: `meta_not_found_or_invalid: ${e.message}` }));
