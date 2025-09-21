@@ -33,6 +33,7 @@
 1) Put the logo on top.
    - Inquiryon's logo should be included, https://inquiryon.com/logo.png. The word Inquiryon of matching size should be next to the logo.
    - The background of the logo section should be gradient from grey (60%) to black (100%).
+   - Since it will be used for both web page and Outlook email, and Outlook does not support CSS gradients, use a solid grey background-color as fallback.
    - The logo should be centered.
 2) Show the Title of the event.
 3) A section to show the date/time/speaker/venue of the event. And ask people to join us.

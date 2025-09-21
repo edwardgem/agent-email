@@ -70,7 +70,7 @@ Patterns for REST APIs
   - HITL milestones: `awaiting human input (loop N)`, `hitl loop back #N`, `hitl approved`, `hitl rejected`, `hitl input: ...`, `hitl provided input; regenerating html`
 - Tips:
 - Avoid logging large/sensitive blobs to the remote API (keep full prompt/HTML in local logs only).
-- Include `instance_id` in log metadata for traceability.
+- Include `instance_id` as a top-level field in the log payload (not inside `meta`) for traceability.
 
 6) Human‑In‑The‑Loop (HITL)
 - Purpose: Insert human judgment and edits before an agent takes an action (e.g., sending an email).

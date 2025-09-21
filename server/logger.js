@@ -43,7 +43,8 @@ async function agent_log({ message, config, level = 'info', meta = {}, service =
           level,
           message,
           timestamp: new Date().toISOString(),
-          meta: { ...meta, instance_id: instanceId }
+          instance_id: instanceId,
+          meta: { ...meta }
         })
       });
     } catch (e) {
