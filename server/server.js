@@ -61,6 +61,23 @@ function appendProgress(metaPath, message) {
     return e.message || String(e);
   }
 }
+
+function readMeta(metaPath) {
+  try {
+    if (!fs.existsSync(metaPath)) return null;
+    const raw = fs.readFileSync(metaPath, 'utf8');
+    return JSON.parse(raw);
+  } catch (e) {
+    console.log('[ERROR] readMeta:', e);
+    return null;
+  }
+}
+
+function isMetaStatus(metaPath, status) {
+  if (!metaPath || !status) return false;
+  const meta = readMeta(metaPath);
+  return !!(meta && meta.status === status);
+}
 // Minimal REST wrapper for the email agent
 // No external deps: uses Node http + child_process
 
@@ -342,6 +359,7 @@ function getHitlConfig(base) {
 async function callHitlAgent({ instanceId, htmlPath, html, ctx, base, loopIndex }) {
   const url = getHitlApiUrl();
   const hitlCfg = getHitlConfig(base);
+  console.log('[DEBUG] HITL config from instance:', JSON.stringify(hitlCfg, null, 2));
   const payload = { caller_id: instanceId, html_path: htmlPath, html, hitl: hitlCfg, HITL: base && base['HITL'], human_in_the_loop: base && base['human-in-the-loop'], loop: loopIndex };
   try {
     const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
@@ -392,6 +410,7 @@ async function generateEmailFlow(body, ctxMaybe) {
   appendLogLocal('--- Prompt Start ---', ctx.paths ? ctx.paths.runLog : undefined);
   appendLogLocal(prep.prompt, ctx.paths ? ctx.paths.runLog : undefined);
   appendLogLocal('--- Prompt End ---', ctx.paths ? ctx.paths.runLog : undefined);
+  agent_log({ message: 'Calling LLM to generate email', config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
   // Progress: LLM generating email
   if (ctx.paths) {
     appendProgress(path.join(ctx.paths.root, 'meta.json'), 'llm generating email');
@@ -399,6 +418,17 @@ async function generateEmailFlow(body, ctxMaybe) {
     appendLogLocal('llm generating email', ctx.paths.runLog);
   }
   const { html } = await generateHtml({ provider, model, endpoint, prompt: prep.prompt, options });
+  if (ctx.paths) {
+    const metaPath = path.join(ctx.paths.root, 'meta.json');
+    if (isMetaStatus(metaPath, 'abort')) {
+      agent_log({
+        message: 'Returned from LLM generating email, the instance has been aborted, exit processing.',
+        config: normalizeConfig(base),
+        runLogOverride: ctx.paths.runLog
+      });
+      return { aborted: true, ctx, base };
+    }
+  }
   agent_log({ message: `completed generating email using LLM (model: ${model})`, config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
   // Progress: writing html output
   if (ctx.paths) {
@@ -412,7 +442,6 @@ async function generateEmailFlow(body, ctxMaybe) {
   // Progress: generated html
   if (ctx.paths) {
     appendProgress(path.join(ctx.paths.root, 'meta.json'), 'generated html email');
-    agent_log({ message: 'generated html email', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
   }
   return { html, htmlOutputRel, outputPath, base, ctx };
 }
@@ -448,13 +477,21 @@ async function sendEmailFlow(body, baseMaybe, ctxMaybe, overrideHtml) {
   if (!toFinal.length && !ccFinal.length && !bccFinal.length) {
     return { error: 'no_recipients_configured' };
   }
+  const instanceId = getInstanceIdFromCtx(ctx);
+  const metaPath = ctx.paths ? path.join(ctx.paths.root, 'meta.json') : undefined;
+  if (ctx.paths && isMetaStatus(metaPath, 'abort')) {
+    agent_log({
+      message: 'The instance has been aborted, exit processing without sending group email.',
+      config: normalizeConfig(base),
+      runLogOverride: ctx.paths.runLog
+    });
+    return { aborted: true, ctx, base };
+  }
   appendLogLocal(`[PROGRESS] Sending email. to=${toFinal.join(', ')} cc=${ccFinal.join(', ')} bcc=${bccFinal.join(', ')}`,
     ctx.paths ? ctx.paths.runLog : undefined);
   // HITL check before sending (unless explicitly skipped by caller)
   // Enforces presence of a HITL config for instance runs and executes a
   // single request → decision.
-  const instanceId = getInstanceIdFromCtx(ctx);
-  const metaPath = ctx.paths ? path.join(ctx.paths.root, 'meta.json') : undefined;
   const hitlEnabled = !!getHitlConfig(base).enable;
   if (!skipHitl) {
     // Call HITL agent
@@ -582,6 +619,9 @@ async function handleGenerate(req, res, body) {
         try {
           const ctx = { paths, base };
           const gen = await generateEmailFlow(body, ctx);
+          if (gen.aborted) {
+            return;
+          }
           if (gen.error || gen.errorObj) {
             const errMsg = gen.error || (gen.errorObj && `${gen.errorObj.code}${gen.errorObj.path ? ` (${gen.errorObj.path})` : ''}`) || 'unknown_error';
             agent_log({ message: `async generate error: ${errMsg}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
@@ -607,6 +647,11 @@ async function handleGenerate(req, res, body) {
       return;
     }
     const gen = await generateEmailFlow(body);
+    if (gen.aborted) {
+      res.writeHead(409, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'instance_aborted' }));
+      return;
+    }
     if (gen.error) {
       const { base, ctx } = gen;
       if (ctx && ctx.paths) {
@@ -683,6 +728,9 @@ async function handleSend(req, res, body) {
         try {
           const ctx = { paths, base };
           const sent = await sendEmailFlow(body, base, ctx);
+          if (sent.aborted) {
+            return;
+          }
           if (sent.error) {
             agent_log({ message: `async send error: ${sent.error}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
             const metaErr2 = updateMetaJson(metaPath, 'abort', { last_error: sent.error });
@@ -718,6 +766,11 @@ async function handleSend(req, res, body) {
     }
     const base = ctx.base;
     const sent = await sendEmailFlow(body, base, ctx);
+    if (sent.aborted) {
+      res.writeHead(409, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'instance_aborted' }));
+      return;
+    }
     if (sent.error) {
       res.writeHead(400, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: sent.error }));
@@ -786,6 +839,9 @@ async function handleGenerateSend(req, res, body) {
         try {
           const ctx = { paths, base };
           const gen = await generateEmailFlow(body, ctx);
+          if (gen.aborted) {
+            return;
+          }
           if (gen.error || gen.errorObj) {
             const errMsg = gen.error || (gen.errorObj && `${gen.errorObj.code}${gen.errorObj.path ? ` (${gen.errorObj.path})` : ''}`) || 'unknown_error';
             agent_log({ message: `async generate-send (generate) error: ${errMsg}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
@@ -795,6 +851,9 @@ async function handleGenerateSend(req, res, body) {
             return;
           }
           const sent = await sendEmailFlow(body, base, ctx, gen.html);
+          if (sent.aborted) {
+            return;
+          }
           if (sent.error) {
             agent_log({ message: `async generate-send (send) error: ${sent.error}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
             const metaErr3 = updateMetaJson(metaPath, 'abort', { last_error: sent.error, last_html_path: gen.htmlOutputRel });
@@ -823,6 +882,11 @@ async function handleGenerateSend(req, res, body) {
       return;
     }
     const gen = await generateEmailFlow(body);
+    if (gen.aborted) {
+      res.writeHead(409, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'instance_aborted' }));
+      return;
+    }
     if (gen.error) {
       const { base, ctx } = gen;
       if (ctx && ctx.paths) {
@@ -839,6 +903,11 @@ async function handleGenerateSend(req, res, body) {
       return;
     }
     const sent = await sendEmailFlow(body, gen.base, gen.ctx, gen.html);
+    if (sent.aborted) {
+      res.writeHead(409, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'instance_aborted' }));
+      return;
+    }
     if (sent.error) {
       res.writeHead(400, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: sent.error }));
@@ -942,6 +1011,11 @@ const server = http.createServer(async (req, res) => {
       if (respond === 'approve') {
         // Avoid noisy agent_log for 'wi response - approve'
         const sent = await sendEmailFlow({ instance_id: instanceId, skipHitl: true }, base, ctx);
+        if (sent && sent.aborted) {
+          res.writeHead(409, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'instance_aborted' }));
+          return;
+        }
         if (sent && sent.error) {
           res.writeHead(400, { 'content-type': 'application/json' });
           res.end(JSON.stringify({ error: sent.error }));
@@ -987,6 +1061,9 @@ const server = http.createServer(async (req, res) => {
           try {
             // Generate with additional user instructions, then send
             const gen = await generateEmailFlow({ instance_id: instanceId, instructions: info }, ctx);
+            if (gen.aborted) {
+              return;
+            }
             if (gen.error || gen.errorObj) {
               const errMsg = gen.error || (gen.errorObj && `${gen.errorObj.code}${gen.errorObj.path ? ` (${gen.errorObj.path})` : ''}`) || 'unknown_error';
               agent_log({ message: `modify flow error: ${errMsg}`,
@@ -995,6 +1072,9 @@ const server = http.createServer(async (req, res) => {
               return;
             }
             const sent = await sendEmailFlow({ instance_id: instanceId }, gen.base, gen.ctx, gen.html);
+            if (sent && sent.aborted) {
+              return;
+            }
             if (sent && sent.error) {
               agent_log({ message: `modify send error: ${sent.error}`,
                 config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
@@ -1059,6 +1139,44 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(500, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: e.stack || e.message }));
     }
+    return;
+  }
+
+  if (method === 'POST' && parsed.pathname === '/api/email-agent/abort') {
+    let body = {};
+    try { body = await readJsonBody(req); } catch (_) {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'invalid_json' }));
+      return;
+    }
+    const instanceId = body && body.instance_id;
+    if (!instanceId) {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'missing_instance_id' }));
+      return;
+    }
+    const reason = body && (body.reason || body.last_error || body.message || body.note);
+    const ctx = resolveContext({ instance_id: instanceId }, { activate: false });
+    if (ctx.error || !ctx.paths) {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: ctx.error || 'abort_requires_instance_context' }));
+      return;
+    }
+    const metaPath = path.join(ctx.paths.root, 'meta.json');
+    const progressMsg = reason ? `abort requested via API (${summarizeInfoText(reason)})` : 'abort requested via API';
+    const updates = reason ? { last_error: reason } : undefined;
+    const metaErr = updateMetaJson(metaPath, 'abort', updates);
+    if (metaErr) {
+      res.writeHead(500, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: metaErr }));
+      return;
+    }
+    appendProgress(metaPath, progressMsg);
+    const normalized = normalizeConfig(ctx.base);
+    agent_log({ message: progressMsg, config: normalized, runLogOverride: ctx.paths.runLog });
+    agent_log({ message: 'state - abort', config: normalized, runLogOverride: ctx.paths.runLog });
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, status: 'abort', instance_id: instanceId }));
     return;
   }
 

@@ -29,7 +29,16 @@ function appendLogLocal(message, runLogOverride) {
 // Main agent_log function: log to REST API and local run.log
 async function agent_log({ message, config, level = 'info', meta = {}, service = 'agent-email', runLogOverride }) {
   if (!message || !config) return;
-  const instanceId = config.instance_id || 'unknown-instance';
+  // Extract instance_id from runLogOverride path (instance folder name) if available
+  let instanceId = 'unknown-instance';
+  if (runLogOverride) {
+    // runLogOverride is like /path/to/instance-folder/logs/run.log
+    // Extract the folder name as instance_id
+    const instanceFolder = path.dirname(path.dirname(runLogOverride));
+    instanceId = path.basename(instanceFolder);
+  } else if (config.instance_id) {
+    instanceId = config.instance_id;
+  }
   // Always log locally
   appendLogLocal(message, runLogOverride);
   // Only send to REST API for instance runs (indicated by runLogOverride)
