@@ -1,6 +1,6 @@
 {
   "instance_id": "email-20250909140103",
-  "agent_api": "http://host.docker.internal:3001/api/email-agent/generate-send",
+  "agent_api": "http://172.31.20.232:3001/api/email-agent/generate-send",
   "email_subject": "Safe AI Agents with Human-in-the-Loop - Brown Bag Session (8/22)",
   "sender_email": "edwardgem@gmail.com",
   "sender_name": "Edward Cheng, Inquiryon",
