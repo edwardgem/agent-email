@@ -1344,23 +1344,42 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (method === 'POST' && (parsed.pathname === '/api/email-agent/generate' || parsed.pathname === '/api/email-agent/send' || parsed.pathname === '/api/email-agent/generate-send')) {
+    console.log('[DEBUG] Received POST request to:', parsed.pathname);
     let body = {};
-    try { body = await readJsonBody(req); } catch (e) {
+    try {
+      body = await readJsonBody(req);
+      console.log('[DEBUG] Request body:', JSON.stringify(body, null, 2));
+    } catch (e) {
+      console.error('[ERROR] Failed to parse JSON body:', e);
       res.writeHead(400, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ error: 'invalid_json' }));
+      res.end(JSON.stringify({ error: 'invalid_json', detail: String(e) }));
       return;
     }
+
+    console.log('[DEBUG] Attempting to resolve context for instance_id:', body.instance_id);
+    console.log('[DEBUG] AGENT_FOLDER env:', process.env.AGENT_FOLDER);
+
     // Log receipt of API call per endpoint
     try {
       const ctx = resolveContext(body, { activate: false });
+      console.log('[DEBUG] Context resolved:', ctx.error ? `ERROR: ${ctx.error}` : 'SUCCESS');
+      if (ctx.error) {
+        console.error('[ERROR] Context resolution failed:', ctx.error);
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'context_resolution_failed', detail: ctx.error }));
+        return;
+      }
       const base = ctx && ctx.base ? ctx.base : {};
       let label = 'unknown';
       if (parsed.pathname === '/api/email-agent/generate') label = 'generate';
       else if (parsed.pathname === '/api/email-agent/send') label = 'send';
       else if (parsed.pathname === '/api/email-agent/generate-send') label = 'generate-send';
       agent_log({ message: `receive API call: ${label}`, config: normalizeConfig(base), runLogOverride: ctx && ctx.paths ? ctx.paths.runLog : undefined });
-    } catch (_) { /* ignore logging errors */ }
+    } catch (err) {
+      console.error('[ERROR] Logging failed:', err);
+    }
 
+    console.log('[DEBUG] Routing to handler for:', parsed.pathname);
     if (parsed.pathname === '/api/email-agent/generate') return handleGenerate(req, res, body);
     if (parsed.pathname === '/api/email-agent/send') return handleSend(req, res, body);
     if (parsed.pathname === '/api/email-agent/generate-send') return handleGenerateSend(req, res, body);
