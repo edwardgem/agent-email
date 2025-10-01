@@ -806,55 +806,88 @@ async function handleSend(req, res, body) {
 
 async function handleGenerateSend(req, res, body) {
   try {
+    console.log('[DEBUG] handleGenerateSend called with body:', JSON.stringify(body, null, 2));
     // Async mode: require instance_id and return 202 immediately after activation
     if (body && body.async === true) {
+      console.log('[DEBUG] Async mode detected');
       if (!body.instance_id) {
+        console.error('[ERROR] Missing instance_id in async mode');
         res.writeHead(400, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ error: 'async_requires_instance_id' }));
         return;
       }
       const baseFolder = process.env.AGENT_FOLDER;
+      console.log('[DEBUG] baseFolder from env:', baseFolder);
       if (!baseFolder) {
+        console.error('[ERROR] AGENT_FOLDER env variable not set');
         res.writeHead(400, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ error: 'missing_env_AGENT_FOLDER' }));
         return;
       }
       const instancePath = path.join(baseFolder, body.instance_id);
+      console.log('[DEBUG] instancePath:', instancePath);
       const paths = resolveAgentPaths(instancePath);
-      fs.mkdirSync(paths.logs, { recursive: true });
-      fs.mkdirSync(paths.artifacts, { recursive: true });
+      console.log('[DEBUG] paths resolved:', JSON.stringify(paths, null, 2));
+      try {
+        fs.mkdirSync(paths.logs, { recursive: true });
+        fs.mkdirSync(paths.artifacts, { recursive: true });
+        console.log('[DEBUG] Created logs and artifacts directories');
+      } catch (e) {
+        console.error('[ERROR] Failed to create directories:', e);
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: `directory_creation_failed: ${e.message}` }));
+        return;
+      }
+      console.log('[DEBUG] Loading config from:', paths.config);
       const base = loadConfig(paths.config);
+      console.log('[DEBUG] Config loaded, keys:', Object.keys(base || {}));
       const metaPath = path.join(paths.root, 'meta.json');
+      console.log('[DEBUG] Updating meta.json at:', metaPath);
       const metaErr = updateMetaJson(metaPath, 'active', { last_error: null });
       if (metaErr) {
+        console.error('[ERROR] meta.json error:', metaErr);
         res.writeHead(400, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ error: `meta.json error: ${metaErr}` }));
         return;
       }
+      console.log('[DEBUG] meta.json updated successfully');
       agent_log({ message: 'state - active (async generate-send)', config: normalizeConfig(base), runLogOverride: paths.runLog });
       const statusUrl = `/api/email-agent/status?instance_id=${encodeURIComponent(body.instance_id)}`;
+      console.log('[DEBUG] Sending 202 Accepted response to client');
       res.writeHead(202, { 'content-type': 'application/json', Location: statusUrl });
       res.end(JSON.stringify({ accepted: true, status: 'active', instance_id: body.instance_id, links: { status: statusUrl } }));
+      console.log('[DEBUG] Starting async workflow in background');
       setImmediate(async () => {
         try {
+          console.log('[DEBUG] Async workflow: Starting generateEmailFlow');
           const ctx = { paths, base };
           const gen = await generateEmailFlow(body, ctx);
+          console.log('[DEBUG] generateEmailFlow completed:', { aborted: gen.aborted, hasError: !!gen.error, hasErrorObj: !!gen.errorObj });
+
           if (gen.aborted) {
+            console.log('[DEBUG] Generation was aborted, exiting');
             return;
           }
           if (gen.error || gen.errorObj) {
             const errMsg = gen.error || (gen.errorObj && `${gen.errorObj.code}${gen.errorObj.path ? ` (${gen.errorObj.path})` : ''}`) || 'unknown_error';
+            console.error('[ERROR] Generation failed:', errMsg);
             agent_log({ message: `async generate-send (generate) error: ${errMsg}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
             const metaErr2 = updateMetaJson(metaPath, 'abort', { last_error: errMsg });
             if (metaErr2) agent_log({ message: `meta.json error: ${metaErr2}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
             agent_log({ message: 'state - abort', config: normalizeConfig(base), runLogOverride: paths.runLog });
             return;
           }
+
+          console.log('[DEBUG] Async workflow: Starting sendEmailFlow');
           const sent = await sendEmailFlow(body, base, ctx, gen.html);
+          console.log('[DEBUG] sendEmailFlow completed:', { aborted: sent.aborted, hasError: !!sent.error, halted: sent.halted });
+
           if (sent.aborted) {
+            console.log('[DEBUG] Send was aborted, exiting');
             return;
           }
           if (sent.error) {
+            console.error('[ERROR] Send failed:', sent.error);
             agent_log({ message: `async generate-send (send) error: ${sent.error}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
             const metaErr3 = updateMetaJson(metaPath, 'abort', { last_error: sent.error, last_html_path: gen.htmlOutputRel });
             if (metaErr3) agent_log({ message: `meta.json error: ${metaErr3}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
@@ -862,17 +895,23 @@ async function handleGenerateSend(req, res, body) {
             return;
           }
           if (sent.halted === 'wait-for-response') {
+            console.log('[DEBUG] Workflow halted, waiting for human response');
             // Leave as active and exit gracefully
             return;
           }
+
+          console.log('[DEBUG] Workflow completed successfully, updating to finished');
           const metaErr4 = updateMetaJson(metaPath, 'finished', { last_error: null, last_html_path: gen.htmlOutputRel, last_send_id: sent.id });
           if (metaErr4) {
+            console.error('[ERROR] Failed to update meta to finished:', metaErr4);
             agent_log({ message: `meta.json error: ${metaErr4}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
             agent_log({ message: 'state - abort', config: normalizeConfig(base), runLogOverride: paths.runLog });
             return;
           }
+          console.log('[DEBUG] Instance finished successfully');
           agent_log({ message: 'state - finished', config: normalizeConfig(base), runLogOverride: paths.runLog });
         } catch (e) {
+          console.error('[ERROR] Async workflow exception:', e.stack || e.message);
           agent_log({ message: `async generate-send exception: ${e.stack || e.message}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
           const metaErr5 = updateMetaJson(metaPath, 'abort', { last_error: String(e && (e.stack || e.message) || e) });
           if (metaErr5) agent_log({ message: `meta.json error: ${metaErr5}`, config: normalizeConfig(base), runLogOverride: paths.runLog });
