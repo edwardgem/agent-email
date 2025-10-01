@@ -1,0 +1,23 @@
+{
+  "instance_id": "email-20250930000000",
+  "email_subject": "Weekly Newsletter",
+  "sender_email": "you@example.com",
+  "sender_name": "Your Name",
+  "html_output": "artifacts/email.html",
+  "prompt_file": "prompt.txt",
+  "to": ["recipient1@example.com", "recipient2@example.com"],
+  "cc": [],
+  "bcc": [],
+  "email": {
+    "transport": "gmail-api"
+  },
+  "human-in-the-loop": {
+    "enable": true
+  },
+  "agent_api": "http://host.docker.internal:3001/api/email-agent/generate-send",
+  "llm": {
+    "provider": "ollama",
+    "model": "llama3.1",
+    "endpoint": "http://host.docker.internal:11434"
+  }
+}

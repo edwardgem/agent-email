@@ -1290,6 +1290,59 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Launch endpoint: GET /api/email-agent/launch?instance_id=xxx
+  // Lightweight wrapper that calls generate-send with async=true
+  if (method === 'GET' && parsed.pathname === '/api/email-agent/launch') {
+    const instanceId = parsed.query && parsed.query.instance_id;
+    if (!instanceId) {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'missing_instance_id' }));
+      return;
+    }
+    // Convert GET to POST body format for generate-send
+    const body = { instance_id: instanceId, async: true };
+    try {
+      const ctx = resolveContext(body, { activate: false });
+      const base = ctx && ctx.base ? ctx.base : {};
+      agent_log({ message: 'receive API call: launch', config: normalizeConfig(base), runLogOverride: ctx && ctx.paths ? ctx.paths.runLog : undefined });
+    } catch (_) { /* ignore logging errors */ }
+    return handleGenerateSend(req, res, body);
+  }
+
+  // Abort endpoint (GET wrapper): GET /api/email-agent/abort?instance_id=xxx
+  // Lightweight wrapper for the existing POST /abort endpoint
+  if (method === 'GET' && parsed.pathname === '/api/email-agent/abort') {
+    const instanceId = parsed.query && parsed.query.instance_id;
+    if (!instanceId) {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'missing_instance_id' }));
+      return;
+    }
+    const reason = parsed.query && parsed.query.reason;
+    const ctx = resolveContext({ instance_id: instanceId }, { activate: false });
+    if (ctx.error || !ctx.paths) {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: ctx.error || 'abort_requires_instance_context' }));
+      return;
+    }
+    const metaPath = path.join(ctx.paths.root, 'meta.json');
+    const progressMsg = reason ? `abort requested via API (${summarizeInfoText(reason)})` : 'abort requested via API';
+    const updates = reason ? { last_error: reason } : undefined;
+    const metaErr = updateMetaJson(metaPath, 'abort', updates);
+    if (metaErr) {
+      res.writeHead(500, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: metaErr }));
+      return;
+    }
+    appendProgress(metaPath, progressMsg);
+    const normalized = normalizeConfig(ctx.base);
+    agent_log({ message: progressMsg, config: normalized, runLogOverride: ctx.paths.runLog });
+    agent_log({ message: 'state - abort', config: normalized, runLogOverride: ctx.paths.runLog });
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, status: 'abort', instance_id: instanceId }));
+    return;
+  }
+
   if (method === 'POST' && (parsed.pathname === '/api/email-agent/generate' || parsed.pathname === '/api/email-agent/send' || parsed.pathname === '/api/email-agent/generate-send')) {
     let body = {};
     try { body = await readJsonBody(req); } catch (e) {
