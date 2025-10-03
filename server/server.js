@@ -1015,6 +1015,7 @@ const server = http.createServer(async (req, res) => {
   if (method === 'POST' && parsed.pathname === '/api/email-agent/hitl-callback') {
     let body = {};
     try { body = await readJsonBody(req); } catch (e) {
+      console.error('[HITL-CALLBACK] Failed to parse JSON body:', e);
       res.writeHead(400, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: 'invalid_json' }));
       return;
@@ -1023,6 +1024,7 @@ const server = http.createServer(async (req, res) => {
     // New param names: response, information. Backward compat: respond, info.
     const respond = body && (body.response || body.respond);
     const info = body && (body.information || body.info) ? String(body.information || body.info) : '';
+    console.log(`[HITL-CALLBACK] Received request: instanceId=${instanceId}, respond=${respond}, info=${info ? info.substring(0, 50) + '...' : '(none)'}`);
     if (!instanceId) {
       res.writeHead(400, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: 'missing_instance_id' }));
@@ -1035,7 +1037,9 @@ const server = http.createServer(async (req, res) => {
     }
     try {
       const ctx = resolveContext({ instance_id: instanceId }, { activate: false });
+      console.log(`[HITL-CALLBACK] Context resolved: error=${ctx.error}, hasBase=${!!ctx.base}, hasPaths=${!!ctx.paths}`);
       if (ctx.error) {
+        console.error(`[HITL-CALLBACK] Context error: ${ctx.error}`);
         res.writeHead(400, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ error: ctx.error }));
         return;
@@ -1048,6 +1052,7 @@ const server = http.createServer(async (req, res) => {
       agent_log({ message: wiMsg, config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
 
       if (respond === 'approve') {
+        console.log('[HITL-CALLBACK] Processing approve action');
         // Avoid noisy agent_log for 'wi response - approve'
         const sent = await sendEmailFlow({ instance_id: instanceId, skipHitl: true }, base, ctx);
         if (sent && sent.aborted) {
@@ -1085,6 +1090,7 @@ const server = http.createServer(async (req, res) => {
       }
 
       if (respond === 'modify') {
+        console.log('[HITL-CALLBACK] Processing modify action');
         if (!info) {
           res.writeHead(400, { 'content-type': 'application/json' });
           res.end(JSON.stringify({ error: 'missing_information' }));
@@ -1140,6 +1146,7 @@ const server = http.createServer(async (req, res) => {
       }
 
       if (respond === 'reject') {
+        console.log('[HITL-CALLBACK] Processing reject action');
         if (!info) {
           res.writeHead(400, { 'content-type': 'application/json' });
           res.end(JSON.stringify({ error: 'missing_information' }));
@@ -1175,6 +1182,7 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(501, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: 'response_not_implemented', response: respond }));
     } catch (e) {
+      console.error('[HITL-CALLBACK] Error processing request:', e);
       res.writeHead(500, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: e.stack || e.message }));
     }
