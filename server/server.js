@@ -360,7 +360,15 @@ async function callHitlAgent({ instanceId, htmlPath, html, ctx, base, loopIndex 
   const url = getHitlApiUrl();
   const hitlCfg = getHitlConfig(base);
   console.log('[DEBUG] HITL config from instance:', JSON.stringify(hitlCfg, null, 2));
-  const payload = { caller_id: instanceId, html_path: htmlPath, html, hitl: hitlCfg, HITL: base && base['HITL'], human_in_the_loop: base && base['human-in-the-loop'], loop: loopIndex };
+  const payload = { 
+    caller_id: instanceId, 
+    html_path: htmlPath, 
+    html, 
+    hitl: hitlCfg, 
+    HITL: base && base['HITL'], 
+    human_in_the_loop: base && base['human-in-the-loop'], 
+    loop: loopIndex
+  };
   try {
     const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
     if (!res.ok) {

@@ -31,14 +31,30 @@ async function agent_log({ message, config, level = 'info', meta = {}, service =
   if (!message || !config) return;
   // Extract instance_id from runLogOverride path (instance folder name) if available
   let instanceId = 'unknown-instance';
+  let username = 'system';
+  
   if (runLogOverride) {
     // runLogOverride is like /path/to/instance-folder/logs/run.log
     // Extract the folder name as instance_id
     const instanceFolder = path.dirname(path.dirname(runLogOverride));
     instanceId = path.basename(instanceFolder);
+    
+    // Read owner from meta.json
+    const metaPath = path.join(instanceFolder, 'meta.json');
+    try {
+      if (fs.existsSync(metaPath)) {
+        const metaRaw = fs.readFileSync(metaPath, 'utf8');
+        const metaData = JSON.parse(metaRaw);
+        username = metaData.owner || 'unknown-user';
+      }
+    } catch (e) {
+      // Fallback to system if meta.json read fails
+      username = 'unknown-user';
+    }
   } else if (config.instance_id) {
     instanceId = config.instance_id;
   }
+  
   // Always log locally
   appendLogLocal(message, runLogOverride);
   // Only send to REST API for instance runs (indicated by runLogOverride)
@@ -49,11 +65,9 @@ async function agent_log({ message, config, level = 'info', meta = {}, service =
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           service,
-          level,
           message,
-          timestamp: new Date().toISOString(),
           instance_id: instanceId,
-          meta: { ...meta }
+          username: username
         })
       });
     } catch (e) {
