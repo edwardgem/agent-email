@@ -425,7 +425,19 @@ async function generateEmailFlow(body, ctxMaybe) {
     // Log locally for the instance instead of agent_log (no remote)
     appendLogLocal('llm generating email', ctx.paths.runLog);
   }
-  const { html } = await generateHtml({ provider, model, endpoint, prompt: prep.prompt, options });
+  const { text: llmText, html } = await generateHtml({ provider, model, endpoint, prompt: prep.prompt, options });
+  const runLogTarget = ctx.paths ? ctx.paths.runLog : undefined;
+  const llmResponse = llmText || html || '';
+  if (llmResponse) {
+    const logFn = (msg) => appendLogLocal(msg, runLogTarget);
+    logFn('--- LLM Response Start ---');
+    llmResponse.split(/\r?\n/).forEach(line => logFn(line));
+    logFn('--- LLM Response End ---');
+  } else if (runLogTarget) {
+    appendLogLocal('--- LLM Response Start ---', runLogTarget);
+    appendLogLocal('(empty LLM response)', runLogTarget);
+    appendLogLocal('--- LLM Response End ---', runLogTarget);
+  }
   if (ctx.paths) {
     const metaPath = path.join(ctx.paths.root, 'meta.json');
     if (isMetaStatus(metaPath, 'abort')) {
