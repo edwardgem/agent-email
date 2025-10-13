@@ -25,6 +25,7 @@ function updateMetaJson(metaPath, state, updates) {
     }
     const raw = fs.readFileSync(metaPath, 'utf8');
     const meta = JSON.parse(raw);
+    const prevStatus = meta && typeof meta.status === 'string' ? meta.status.toLowerCase() : undefined;
     const now = new Date();
     if (state === 'active') {
       meta.status = 'active';
@@ -39,6 +40,8 @@ function updateMetaJson(metaPath, state, updates) {
       Object.assign(meta, updates);
     }
     fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2), 'utf8');
+    const nextStatus = meta && typeof meta.status === 'string' ? meta.status.toLowerCase() : undefined;
+    maybeTriggerSummaryRegeneration(metaPath, prevStatus, nextStatus);
     return null;
   } catch (e) {
     return e.message || String(e);
@@ -89,6 +92,63 @@ const fetch = require('node-fetch');
 const { generateHtml } = require('./llm');
 const { sendEmail } = require('./gmail');
 const { agent_log, appendLogLocal } = require('./logger');
+
+const SUMMARY_API_FALLBACK = 'http://127.0.0.1:5000';
+
+function resolveSummaryBaseUrl() {
+  const candidates = [
+    process.env.AMP_SUMMARY_BASE_URL,
+    process.env.AMP_BACKEND_BASE_URL,
+    process.env.AMP_BACKEND_URL,
+    process.env.AMP_BASE_URL,
+    process.env.AMP_PORTAL_URL,
+  ];
+  for (const raw of candidates) {
+    if (raw && typeof raw === 'string' && raw.trim()) {
+      return raw.trim().replace(/\/+$/, '');
+    }
+  }
+  return SUMMARY_API_FALLBACK;
+}
+
+function deriveInstanceIdFromMeta(metaPath) {
+  try {
+    if (!metaPath) return null;
+    const instanceDir = path.dirname(metaPath);
+    if (!instanceDir) return null;
+    return path.basename(instanceDir) || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function shouldTriggerSummary(prevStatus, nextStatus) {
+  if (!prevStatus || !nextStatus) return false;
+  return prevStatus === 'active' && (nextStatus === 'finished' || nextStatus === 'abort');
+}
+
+function maybeTriggerSummaryRegeneration(metaPath, prevStatus, nextStatus) {
+  if (!shouldTriggerSummary(prevStatus, nextStatus)) return;
+  const instanceId = deriveInstanceIdFromMeta(metaPath);
+  if (!instanceId) return;
+  const baseUrl = resolveSummaryBaseUrl();
+  if (!baseUrl) return;
+  const target = `${baseUrl}/api/alp/instances/${encodeURIComponent(instanceId)}/summary/regenerate`;
+  fetch(target, { method: 'POST' })
+    .then(resp => {
+      if (resp.ok) return;
+      return resp.text().then(text => {
+        const suffix = text ? ` ${text}` : '';
+        console.warn(`[SUMMARY] Failed to regenerate summary for ${instanceId}: HTTP ${resp.status}${suffix}`);
+      }).catch(() => {
+        console.warn(`[SUMMARY] Failed to regenerate summary for ${instanceId}: HTTP ${resp.status}`);
+      });
+    })
+    .catch(err => {
+      const msg = err && err.message ? err.message : err;
+      console.warn(`[SUMMARY] Error calling summary API for ${instanceId}: ${msg}`);
+    });
+}
 
 const REPO_ROOT = path.resolve(__dirname, '..');
 const DEFAULT_CONFIG_PATH = path.join(REPO_ROOT, 'config.json');
