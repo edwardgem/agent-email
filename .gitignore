@@ -15,3 +15,6 @@ tmp/
 
 # Local environment
 .env
+
+# PM2 process management
+ecosystem.config.js
