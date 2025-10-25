@@ -414,7 +414,7 @@ function getHitlConfig(base) {
  * Call the configured HITL REST endpoint with current context.
  * Expects a JSON response with one of the statuses:
  *  - no-hitl: proceed without blocking
- *  - wait-for-response: pause and wait for WI callback
+ *  - waiting-for-response: pause and wait for WI callback
  */
 async function callHitlAgent({ instanceId, htmlPath, html, ctx, base, loopIndex }) {
   const url = getHitlApiUrl();
@@ -622,15 +622,15 @@ async function sendEmailFlow(body, baseMaybe, ctxMaybe, overrideHtml) {
       }
       // continue to send
     }
-    // Accept both 'wait-for-response' and 'active' as pause-and-wait indicators
-    if (status === 'wait-for-response' || status === 'active') {
+    // Accept both 'waiting-for-response' and 'active' as pause-and-wait indicators
+    if (status === 'waiting-for-response' || status === 'active') {
       if (ctx.paths) {
-        appendProgress(metaPath, 'hitl wait-for-response');
+        appendProgress(metaPath, 'hitl waiting-for-response');
         // Log locally for the instance instead of agent_log (no remote)
-        appendLogLocal('hitl wait-for-response', ctx.paths.runLog);
+        appendLogLocal('hitl waiting-for-response', ctx.paths.runLog);
       }
       // Exit gracefully without changing state
-      return { halted: 'wait-for-response', ctx, base };
+      return { halted: 'waiting-for-response', ctx, base };
     }
     // Unknown status: abort instance and exit gracefully
     if (ctx.paths) {
@@ -818,7 +818,7 @@ async function handleSend(req, res, body) {
             agent_log({ message: 'state - abort', config: normalizeConfig(base), runLogOverride: paths.runLog });
             return;
           }
-          if (sent.halted === 'wait-for-response') {
+          if (sent.halted === 'waiting-for-response') {
             // Leave as active and exit gracefully
             return;
           }
@@ -856,7 +856,7 @@ async function handleSend(req, res, body) {
       res.end(JSON.stringify({ error: sent.error }));
       return;
     }
-    if (sent.halted === 'wait-for-response') {
+    if (sent.halted === 'waiting-for-response') {
       // Do not change state; remain active
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ ok: true, status: 'waiting-for-response' }));
@@ -974,7 +974,7 @@ async function handleGenerateSend(req, res, body) {
             agent_log({ message: 'state - abort', config: normalizeConfig(base), runLogOverride: paths.runLog });
             return;
           }
-          if (sent.halted === 'wait-for-response') {
+          if (sent.halted === 'waiting-for-response') {
             console.log('[DEBUG] Workflow halted, waiting for human response');
             // Leave as active and exit gracefully
             return;
@@ -1032,7 +1032,7 @@ async function handleGenerateSend(req, res, body) {
       res.end(JSON.stringify({ error: sent.error }));
       return;
     }
-    if (sent.halted === 'wait-for-response') {
+    if (sent.halted === 'waiting-for-response') {
       // Do not change state; remain active
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ ok: true, htmlPath: gen.htmlOutputRel, status: 'waiting-for-response' }));
@@ -1206,7 +1206,7 @@ const server = http.createServer(async (req, res) => {
               // Keep instance active; do not change state on modify errors
               return;
             }
-            if (sent && sent.halted === 'wait-for-response') {
+            if (sent && sent.halted === 'waiting-for-response') {
               // NOTE: Do not change instance state here; remain 'active'.
               const infoSuffix = info && info.trim() ? `, information: ${summarizeInfoText(info)}` : '';
               agent_log({ message: `finish processing HITL workitem response of modify${infoSuffix}`,
@@ -1321,7 +1321,7 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ error: 'invalid_json' }));
       return;
     }
-    // Optional query overrides: ?decision=no-hitl|wait-for-response
+    // Optional query overrides: ?decision=no-hitl|waiting-for-response
     const decisionOverride = parsed.query && (parsed.query.decision || parsed.query.status);
     const decision = (decisionOverride && String(decisionOverride)) || 'no-hitl';
     const resp = { status: decision };
