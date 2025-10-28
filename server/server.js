@@ -490,7 +490,30 @@ async function generateEmailFlow(body, ctxMaybe) {
     // Log locally for the instance instead of agent_log (no remote)
     appendLogLocal('llm generating email', ctx.paths.runLog);
   }
-  const { text: llmText, html } = await generateHtml({ provider, model, endpoint, prompt: prep.prompt, options });
+  
+  let llmText, html;
+  try {
+    const result = await generateHtml({ provider, model, endpoint, prompt: prep.prompt, options });
+    llmText = result.text;
+    html = result.html;
+  } catch (e) {
+    const errorMsg = e.message || String(e);
+    appendLogLocal(`[ERROR] LLM generation failed: ${errorMsg}`, ctx.paths ? ctx.paths.runLog : undefined);
+    
+    // Any LLM error is non-recoverable, abort the instance
+    if (ctx.paths) {
+      const metaPath = path.join(ctx.paths.root, 'meta.json');
+      appendProgress(metaPath, `llm error: ${summarizeInfoText(errorMsg)}`);
+      const metaErr = updateMetaJson(metaPath, 'abort', { last_error: errorMsg });
+      if (metaErr) {
+        appendLogLocal(`[ERROR] Failed to update meta.json: ${metaErr}`, ctx.paths.runLog);
+      }
+      agent_log({ message: 'state - abort', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
+    }
+    // Always return aborted status for LLM errors
+    return { aborted: true, error: errorMsg, ctx, base };
+  }
+  
   const runLogTarget = ctx.paths ? ctx.paths.runLog : undefined;
   const llmResponse = llmText || html || '';
   if (llmResponse) {
@@ -1324,8 +1347,8 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     appendProgress(metaPath, progressMsg);
+    appendLogLocal(progressMsg, ctx.paths.runLog);
     const normalized = normalizeConfig(ctx.base);
-    agent_log({ message: progressMsg, config: normalized, runLogOverride: ctx.paths.runLog });
     agent_log({ message: 'state - abort', config: normalized, runLogOverride: ctx.paths.runLog });
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ ok: true, status: 'abort', instance_id: instanceId }));
@@ -1487,8 +1510,8 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     appendProgress(metaPath, progressMsg);
+    appendLogLocal(progressMsg, ctx.paths.runLog);
     const normalized = normalizeConfig(ctx.base);
-    agent_log({ message: progressMsg, config: normalized, runLogOverride: ctx.paths.runLog });
     agent_log({ message: 'state - abort', config: normalized, runLogOverride: ctx.paths.runLog });
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ ok: true, status: 'abort', instance_id: instanceId }));
