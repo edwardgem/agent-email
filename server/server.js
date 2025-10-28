@@ -29,12 +29,17 @@ function updateMetaJson(metaPath, state, updates) {
     const now = new Date();
     if (state === 'active') {
       meta.status = 'active';
-      meta.started_at = formatDateYMDHMS(now);
+      if (!meta.started_at) {
+        meta.started_at = formatDateYMDHMS(now);
+      }
     } else if (state === 'finished') {
       meta.status = 'finished';
       meta.finished_at = formatDateYMDHMS(now);
     } else if (state === 'abort') {
       meta.status = 'abort';
+    } else if (state === 'wait') {
+      meta.status = 'wait';
+      meta.wait_started_at = formatDateYMDHMS(now);
     }
     if (updates && typeof updates === 'object') {
       Object.assign(meta, updates);
@@ -622,14 +627,22 @@ async function sendEmailFlow(body, baseMaybe, ctxMaybe, overrideHtml) {
       }
       // continue to send
     }
-    // Accept both 'waiting-for-response' and 'active' as pause-and-wait indicators
+    // Accept both 'waiting-for-response' and 'active' as pause-and-wait indicators; transition instance into wait state
     if (status === 'waiting-for-response' || status === 'active') {
       if (ctx.paths) {
+        const normalizedConfig = normalizeConfig(base);
         appendProgress(metaPath, 'hitl waiting-for-response');
+        const metaErr = updateMetaJson(metaPath, 'wait');
+        if (metaErr) {
+          agent_log({ message: `meta.json error: ${metaErr}`, level: 'error', config: normalizedConfig, runLogOverride: ctx.paths.runLog });
+        } else {
+          appendProgress(metaPath, 'state wait');
+          agent_log({ message: 'state - wait', config: normalizedConfig, runLogOverride: ctx.paths.runLog });
+        }
         // Log locally for the instance instead of agent_log (no remote)
         appendLogLocal('hitl waiting-for-response', ctx.paths.runLog);
       }
-      // Exit gracefully without changing state
+      // Exit gracefully after entering wait state
       return { halted: 'waiting-for-response', ctx, base };
     }
     // Unknown status: abort instance and exit gracefully
@@ -1125,11 +1138,23 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       const base = ctx.base;
+      const normalizedConfig = normalizeConfig(base);
       // Log receipt of WI response and include a concise info snippet when present
       const metaPath = ctx.paths ? path.join(ctx.paths.root, 'meta.json') : undefined;
       const infoSuffix = info && info.trim() ? `, info=${summarizeInfoText(info)}` : '';
       const wiMsg = `receive call from agent work item processing, response=${respond}${infoSuffix}`;
-      agent_log({ message: wiMsg, config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
+      agent_log({ message: wiMsg, config: normalizedConfig, runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
+
+      // Resume instance from wait state upon HITL callback
+      if (ctx.paths && metaPath && isMetaStatus(metaPath, 'wait')) {
+        const metaErr = updateMetaJson(metaPath, 'active', { wait_started_at: null });
+        if (metaErr) {
+          agent_log({ message: `meta.json error: ${metaErr}`, level: 'error', config: normalizedConfig, runLogOverride: ctx.paths.runLog });
+        } else {
+          appendProgress(metaPath, 'state active (hitl callback)');
+          agent_log({ message: 'state - active (hitl callback)', config: normalizedConfig, runLogOverride: ctx.paths.runLog });
+        }
+      }
 
       if (respond === 'approve') {
         console.log('[HITL-CALLBACK] Processing approve action');
