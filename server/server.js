@@ -611,7 +611,7 @@ async function sendEmailFlow(body, baseMaybe, ctxMaybe, overrideHtml) {
     const decision = await callHitlAgent({ instanceId, htmlPath, html, ctx, base, loopIndex: 0 });
     // Log optional informational message from HITL response
     if (decision && decision.information) {
-      const infoMsg = String(decision.information);
+      const infoMsg = (() => { const val = decision.information; if (typeof val === 'string') return val; try { const json = JSON.stringify(val); return json === undefined ? String(val) : json; } catch (_) { return String(val); } })();
       if (ctx.paths) {
         appendProgress(metaPath, `hitl information: ${infoMsg}`);
         agent_log({ message: `hitl information: ${infoMsg}`, config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
@@ -1165,7 +1165,7 @@ const server = http.createServer(async (req, res) => {
       // Log receipt of WI response and include a concise info snippet when present
       const metaPath = ctx.paths ? path.join(ctx.paths.root, 'meta.json') : undefined;
       const infoSuffix = info && info.trim() ? `, info=${summarizeInfoText(info)}` : '';
-      const wiMsg = `receive call from agent work item processing, response=${respond}${infoSuffix}`;
+      const wiMsg = `receive call from user - work item processing, response=${respond}${infoSuffix}`;
       agent_log({ message: wiMsg, config: normalizedConfig, runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
 
       // Resume instance from wait state upon HITL callback
@@ -1196,6 +1196,7 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ ok: true, id: sent.id }));
         // finalize state for instances (also logs 'state - finished')
+        const infoSuffix = info && info.trim() ? `, information: ${summarizeInfoText(info)}` : '';
         if (ctx.paths) {
           const metaPath = path.join(ctx.paths.root, 'meta.json');
           const metaErr = updateMetaJson(metaPath, 'finished');
@@ -1204,15 +1205,13 @@ const server = http.createServer(async (req, res) => {
             agent_log({ message: 'state - abort', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
             return;
           }
+          agent_log({ message: `finish processing HITL workitem response of approve${infoSuffix}`,
+            config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
           agent_log({ message: 'state - finished', config: normalizeConfig(base), runLogOverride: ctx.paths.runLog });
         } else {
-          agent_log({ message: 'state - finished', config: normalizeConfig(base) });
-        }
-        // Finish marker for HITL workitem processing (approve)
-        {
-          const infoSuffix = info && info.trim() ? `, information: ${summarizeInfoText(info)}` : '';
           agent_log({ message: `finish processing HITL workitem response of approve${infoSuffix}`,
-            config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
+            config: normalizeConfig(base) });
+          agent_log({ message: 'state - finished', config: normalizeConfig(base) });
         }
         return;
       }
