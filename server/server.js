@@ -316,7 +316,8 @@ function preparePromptText(promptText, body, base, ctx) {
   const userInstr = (body.instructions || '').trim();
   const keyInstrSection = buildKeyInstructionsSection(userInstr);
   const promptWithKeys = injectKeyInstructionsIntoPrompt(promptText, keyInstrSection);
-  if (!userInstr) return { prompt: `${promptWithKeys}\n\nIMPORTANT: Your response must contain ONLY the HTML email content wrapped in \`\`\`html code blocks.` };
+  const jsonAnswerNote = 'IMPORTANT: The orchestrator expects a JSON response. Populate the "answer" field with the complete HTML email (including required HTML structure) and do not return any content outside of the JSON contract.';
+  if (!userInstr) return { prompt: `${promptWithKeys}\n\n${jsonAnswerNote}` };
   const defaultBase = (ctx.paths && ctx.paths.artifacts) ? path.join(ctx.paths.artifacts, 'email.html') : (base.HTML_OUTPUT || path.join('outputs', 'email.html'));
   const srcPathRel = body.htmlPath || body.sourceHtmlPath || defaultBase;
   const srcPath = path.isAbsolute(srcPathRel) ? srcPathRel : (ctx.paths ? path.join(ctx.paths.root, srcPathRel) : path.join(REPO_ROOT, srcPathRel));
@@ -324,9 +325,9 @@ function preparePromptText(promptText, body, base, ctx) {
   if (fs.existsSync(srcPath)) baseHtml = fs.readFileSync(srcPath, 'utf8');
   else if (body.htmlPath || body.sourceHtmlPath) return { error: { code: 'base_html_not_found', path: srcPathRel } };
   if (baseHtml) {
-    return { prompt: `${promptWithKeys}\n\nYou are updating an existing HTML email. Here is the current HTML to modify:\n\n\`\`\`html\n${baseHtml}\n\`\`\`\n\nIMPORTANT: Return ONLY the complete, updated HTML email wrapped in \`\`\`html code blocks. Do not include any explanation.` };
+    return { prompt: `${promptWithKeys}\n\nYou are updating an existing HTML email. Here is the current HTML to modify:\n\n\`\`\`html\n${baseHtml}\n\`\`\`\n\n${jsonAnswerNote}` };
   }
-  return { prompt: `${promptWithKeys}\n\nIMPORTANT: Your response must contain ONLY the HTML email content wrapped in \`\`\`html code blocks.` };
+  return { prompt: `${promptWithKeys}\n\n${jsonAnswerNote}` };
 }
 
 function getLLMConfig(body) {
@@ -387,6 +388,27 @@ function materializeHtmlForSend(body, ctx) {
 function absoluteFromMaybeInstance(relOrAbs, ctx) {
   if (path.isAbsolute(relOrAbs)) return relOrAbs;
   return ctx.paths ? path.join(ctx.paths.root, relOrAbs) : path.join(REPO_ROOT, relOrAbs);
+}
+
+function appendLlmTrace(rootPath, entry, runLogPath) {
+  if (!rootPath || !entry) return;
+  try {
+    const tracePath = path.join(rootPath, 'llm_traces.json');
+    let records = [];
+    if (fs.existsSync(tracePath)) {
+      try {
+        const raw = fs.readFileSync(tracePath, 'utf8');
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) records = parsed;
+      } catch (e) {
+        appendLogLocal(`[WARN] Unable to parse existing llm_traces.json: ${e.message || e}`, runLogPath);
+      }
+    }
+    records.push(entry);
+    fs.writeFileSync(tracePath, JSON.stringify(records, null, 2), 'utf8');
+  } catch (e) {
+    appendLogLocal(`[ERROR] Failed to append llm trace: ${e.message || e}`, runLogPath);
+  }
 }
 
 // ---- Human-in-the-loop (HITL) integration ----
@@ -491,11 +513,15 @@ async function generateEmailFlow(body, ctxMaybe) {
     appendLogLocal('llm generating email', ctx.paths.runLog);
   }
   
-  let llmText, html;
+  let llmText, html, reasoning, llmPromptUsed, llmModelUsed, llmAnswer;
   try {
     const result = await generateHtml({ provider, model, endpoint, prompt: prep.prompt, options });
     llmText = result.text;
     html = result.html;
+    reasoning = result.reasoning;
+    llmPromptUsed = result.prompt;
+    llmModelUsed = result.model || model;
+    llmAnswer = result.answer;
   } catch (e) {
     const errorMsg = e.message || String(e);
     appendLogLocal(`[ERROR] LLM generation failed: ${errorMsg}`, ctx.paths ? ctx.paths.runLog : undefined);
@@ -515,7 +541,7 @@ async function generateEmailFlow(body, ctxMaybe) {
   }
   
   const runLogTarget = ctx.paths ? ctx.paths.runLog : undefined;
-  const llmResponse = llmText || html || '';
+  const llmResponse = llmText || llmAnswer || html || '';
   if (llmResponse) {
     const logFn = (msg) => appendLogLocal(msg, runLogTarget);
     logFn('--- LLM Response Start ---');
@@ -537,7 +563,15 @@ async function generateEmailFlow(body, ctxMaybe) {
       return { aborted: true, ctx, base };
     }
   }
-  agent_log({ message: `completed generating email using LLM (model: ${model})`, config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
+  if (ctx.paths && reasoning) {
+    appendLlmTrace(ctx.paths.root, {
+      call_time: new Date().toISOString(),
+      model: llmModelUsed || model,
+      prompt: llmPromptUsed || prep.prompt,
+      reasoning,
+    }, ctx.paths.runLog);
+  }
+  agent_log({ message: `completed generating email using LLM (model: ${llmModelUsed || model})`, config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
   // Progress: writing html output
   if (ctx.paths) {
     appendProgress(path.join(ctx.paths.root, 'meta.json'), 'saving html email to file');

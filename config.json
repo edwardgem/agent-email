@@ -1,5 +1,5 @@
 {
-  "instance_id": "email-20250909140103",
+  "instance_id": "email-xxx",
   "agent_api": "http://localhost:3001/api/email-agent/generate-send",
   "email_subject": "Safe AI Agents with Human-in-the-Loop - Brown Bag Session (8/22)",
   "sender_email": "edwardgem@gmail.com",
