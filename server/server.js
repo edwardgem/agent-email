@@ -315,9 +315,13 @@ function resolveOutputPathRel(body, base, ctx) {
 function preparePromptText(promptText, body, base, ctx) {
   const userInstr = (body.instructions || '').trim();
   const keyInstrSection = buildKeyInstructionsSection(userInstr);
-  const promptWithKeys = injectKeyInstructionsIntoPrompt(promptText, keyInstrSection);
   const jsonAnswerNote = 'IMPORTANT: The orchestrator expects a JSON response. Populate the "answer" field with the complete HTML email (including required HTML structure) and do not return any content outside of the JSON contract.';
-  if (!userInstr) return { prompt: `${promptWithKeys}\n\n${jsonAnswerNote}` };
+  // Default path: no additional instructions, use the main prompt unchanged.
+  if (!userInstr) {
+    const promptWithKeys = injectKeyInstructionsIntoPrompt(promptText, keyInstrSection);
+    return { prompt: `${promptWithKeys}\n\n${jsonAnswerNote}`, usedExistingHtml: false };
+  }
+
   const defaultBase = (ctx.paths && ctx.paths.artifacts) ? path.join(ctx.paths.artifacts, 'email.html') : (base.HTML_OUTPUT || path.join('outputs', 'email.html'));
   const srcPathRel = body.htmlPath || body.sourceHtmlPath || defaultBase;
   const srcPath = path.isAbsolute(srcPathRel) ? srcPathRel : (ctx.paths ? path.join(ctx.paths.root, srcPathRel) : path.join(REPO_ROOT, srcPathRel));
@@ -325,9 +329,14 @@ function preparePromptText(promptText, body, base, ctx) {
   if (fs.existsSync(srcPath)) baseHtml = fs.readFileSync(srcPath, 'utf8');
   else if (body.htmlPath || body.sourceHtmlPath) return { error: { code: 'base_html_not_found', path: srcPathRel } };
   if (baseHtml) {
-    return { prompt: `${promptWithKeys}\n\nYou are updating an existing HTML email. Here is the current HTML to modify:\n\n\`\`\`html\n${baseHtml}\n\`\`\`\n\n${jsonAnswerNote}` };
+    // Regeneration path: avoid reusing the original prompt; focus solely on applying new instructions to the existing HTML.
+    const simpleHeader = 'Apply the [KEY INSTRUCTIONS] to the included HTML email text to generate the new HTML email.';
+    const promptBody = `${simpleHeader}\n\n${keyInstrSection}\n\nHere is the current HTML email to modify:\n\n\`\`\`html\n${baseHtml}\n\`\`\`\n\n${jsonAnswerNote}`;
+    return { prompt: promptBody, usedExistingHtml: true };
   }
-  return { prompt: `${promptWithKeys}\n\n${jsonAnswerNote}` };
+  // Fallback: no existing HTML available; include key instructions with the original prompt.
+  const promptWithKeys = injectKeyInstructionsIntoPrompt(promptText, keyInstrSection);
+  return { prompt: `${promptWithKeys}\n\n${jsonAnswerNote}`, usedExistingHtml: false };
 }
 
 function getLLMConfig(body) {
@@ -505,7 +514,9 @@ async function generateEmailFlow(body, ctxMaybe) {
   appendLogLocal('--- Prompt Start ---', ctx.paths ? ctx.paths.runLog : undefined);
   appendLogLocal(prep.prompt, ctx.paths ? ctx.paths.runLog : undefined);
   appendLogLocal('--- Prompt End ---', ctx.paths ? ctx.paths.runLog : undefined);
-  agent_log({ message: 'Calling LLM to generate email', config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
+  const isRegenerate = !!prep.usedExistingHtml;
+  const llmCallLabel = isRegenerate ? 'Calling LLM to re-generate email' : 'Calling LLM to generate email';
+  agent_log({ message: llmCallLabel, config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
   // Progress: LLM generating email
   if (ctx.paths) {
     appendProgress(path.join(ctx.paths.root, 'meta.json'), 'llm generating email');
@@ -1198,7 +1209,13 @@ const server = http.createServer(async (req, res) => {
       const normalizedConfig = normalizeConfig(base);
       // Log receipt of WI response and include a concise info snippet when present
       const metaPath = ctx.paths ? path.join(ctx.paths.root, 'meta.json') : undefined;
-      const infoSuffix = info && info.trim() ? `, info=${summarizeInfoText(info)}` : '';
+      const rawInfoSuffix = (label) => {
+        const text = (info || '').trim();
+        return text ? `, ${label}="${text}"` : '';
+      };
+      const infoSuffix = info && info.trim()
+        ? (respond === 'modify' ? rawInfoSuffix('info') : `, info=${summarizeInfoText(info)}`)
+        : '';
       const wiMsg = `receive call from user - work item processing, response=${respond}${infoSuffix}`;
       agent_log({ message: wiMsg, config: normalizedConfig, runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
 
@@ -1289,13 +1306,13 @@ const server = http.createServer(async (req, res) => {
             }
             if (sent && sent.halted === 'waiting-for-response') {
               // NOTE: Do not change instance state here; remain 'active'.
-              const infoSuffix = info && info.trim() ? `, information: ${summarizeInfoText(info)}` : '';
+              const infoSuffix = info && info.trim() ? `, information: "${info.trim()}"` : '';
               agent_log({ message: `finish processing HITL workitem response of modify${infoSuffix}`,
                 config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
               return;
             }
             // Success path; remain active after modify
-            const infoSuffix = info && info.trim() ? `, information: ${summarizeInfoText(info)}` : '';
+            const infoSuffix = info && info.trim() ? `, information: "${info.trim()}"` : '';
             agent_log({ message: `finish processing HITL workitem response of modify${infoSuffix}`,
               config: normalizeConfig(base), runLogOverride: ctx.paths ? ctx.paths.runLog : undefined });
           } catch (e) {

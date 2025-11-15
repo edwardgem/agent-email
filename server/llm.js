@@ -1,12 +1,13 @@
 const http = require('http');
 const https = require('https');
 
-const REASONING_PREAMBLE = `You are a careful assistant. Return ONLY JSON per the schema. No hidden chain-of-thought. Explicitly describe your plan and provide a reasoning and thought summary. In your reasoning, include key_facts, assumptions, and uncertainty_level.`;
+const REASONING_PREAMBLE = `You are a careful assistant. Return ONLY JSON per the schema. No hidden chain-of-thought. Explicitly describe your plan and provide a reasoning and thought summary. In your reasoning, include key_facts, key_instructions, assumptions, and uncertainty_level.`;
 
 const OUTPUT_CONTRACT_SCHEMA = `{
   "reasoning": {
     "summary": "<string>",
     "key_facts": "<string>",
+    "key_instructions": "<string>",
     "policy_rules_applied": "<string>",
     "assumptions": "<string>",
     "uncertainty_level": "<low | medium | high>"
