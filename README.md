@@ -218,7 +218,7 @@ Backward compatibility: Uppercase keys (`EMAIL_SUBJECT`, `SENDER_EMAIL`, `SENDER
 - `POST /api/email-agent/generate-send` — generate and send in one call
 - `GET /api/email-agent/status?instance_id=...` — returns per-instance `meta.json` (status, job info)
 - `GET /api/email-agent/progress?instance_id=...` — returns `{ instance_id, latest: [timestamp, message] | null }`
-- `GET /api/email-agent/progress-all?instance_id=...` — returns `{ instance_id, progress: [[timestamp, message], ...] }`
+- Progress/history is now served by the shared log service. Use `GET /api/log/progress-all?instance_id=...` (see log-agent README). The email-agent-specific `/progress-all` endpoint has been removed.
 - `POST /api/email-agent/hitl-callback` — HITL decision callback; accepts `{ instance_id, response, information }`. `information` is required for `modify` and `reject`. When `response=approve`, sends the instance's default generated HTML email (`artifacts/email.html`) and returns send id.
 - HITL (external): `POST /api/hitl-agent` — expected to accept `{ caller_id, html_path?, html? }` and return `{ status: "no-hitl" | "wait-for-response" }`.
  - Note: The HITL endpoint may also return `{ status: \"active\" }`, which the server treats the same as `\"wait-for-response\"`.

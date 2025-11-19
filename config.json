@@ -1,6 +1,15 @@
 {
   "instance_id": "email-xxx",
-  "agent_api": "http://localhost:3001/api/email-agent/generate-send",
+  "agent_api": {
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "method": "POST",
+    "payload": {
+      "async": true
+    },
+    "url": "http://localhost:3001/api/email-agent/generate-send"
+  },
   "email_subject": "Safe AI Agents with Human-in-the-Loop - Brown Bag Session (8/22)",
   "sender_email": "edwardgem@gmail.com",
   "sender_name": "Edward Cheng, Inquiryon",

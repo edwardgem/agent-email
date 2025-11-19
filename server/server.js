@@ -1486,35 +1486,6 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Progress-all endpoint: returns the full progress array for an instance
-  if (method === 'GET' && parsed.pathname === '/api/email-agent/progress-all') {
-    const instanceId = parsed.query && parsed.query.instance_id;
-    if (!instanceId) {
-      res.writeHead(400, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ error: 'missing_instance_id' }));
-      return;
-    }
-    const baseFolder = process.env.AGENT_FOLDER;
-    if (!baseFolder) {
-      res.writeHead(400, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ error: 'missing_env_AGENT_FOLDER' }));
-      return;
-    }
-    const instancePath = path.join(baseFolder, instanceId);
-    const metaPath = path.join(instancePath, 'meta.json');
-    try {
-      const raw = fs.readFileSync(metaPath, 'utf8');
-      const meta = JSON.parse(raw);
-      const progress = Array.isArray(meta.progress) ? meta.progress : [];
-      res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ instance_id: instanceId, progress }));
-    } catch (e) {
-      res.writeHead(404, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ error: `meta_not_found_or_invalid: ${e.message}` }));
-    }
-    return;
-  }
-
   // Launch endpoint: GET /api/email-agent/launch?instance_id=xxx
   // Lightweight wrapper that calls generate-send with async=true
   if (method === 'GET' && parsed.pathname === '/api/email-agent/launch') {

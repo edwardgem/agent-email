@@ -37,7 +37,7 @@ Purpose
   - Returns `meta.json` contents for observability and job control.
 - Progress (latest): `GET /api/email-agent/progress?instance_id=...`
   - Returns `{ instance_id, latest: [timestamp, message] | null }`.
-- Progress (all): `GET /api/email-agent/progress-all?instance_id=...`
+- Progress (all): via log-agent `GET /api/log/progress-all?instance_id=...`
   - Returns `{ instance_id, progress: [[ts, msg], ...] }`.
 
 Patterns for REST APIs
