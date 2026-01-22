@@ -53,17 +53,19 @@ function updateMetaJson(metaPath, state, updates) {
   }
 }
 
-// Append a progress entry [timestamp, message] to meta.json
+// Append a progress entry to log service (no longer writes meta.json progress)
 function appendProgress(metaPath, message) {
   try {
-    if (!fs.existsSync(metaPath)) {
-      throw new Error(`meta.json not found at ${metaPath}`);
-    }
-    const raw = fs.readFileSync(metaPath, 'utf8');
-    const meta = JSON.parse(raw);
-    if (!Array.isArray(meta.progress)) meta.progress = [];
-    meta.progress.push([formatDateYMDHMS(new Date()), String(message)]);
-    fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2), 'utf8');
+    const instanceRoot = path.dirname(metaPath);
+    const runLogOverride = path.join(instanceRoot, 'logs', 'run.log');
+    const instanceId = path.basename(instanceRoot);
+    const progressMsg = `[progress] ${String(message)}`;
+    agent_log({
+      message: progressMsg,
+      config: { instance_id: instanceId },
+      service: 'email-agent',
+      runLogOverride
+    });
     return null;
   } catch (e) {
     return e.message || String(e);
@@ -79,6 +81,88 @@ function readMeta(metaPath) {
     console.log('[ERROR] readMeta:', e);
     return null;
   }
+}
+
+function stripLogPrefix(message) {
+  if (!message) return '';
+  const msg = String(message).trim();
+  if (msg.startsWith('[')) {
+    const idx = msg.indexOf(']');
+    if (idx !== -1) return msg.slice(idx + 1).trim();
+  }
+  return msg;
+}
+
+function normalizeLogProgress(entry) {
+  let ts = '';
+  let message = '';
+  if (Array.isArray(entry)) {
+    ts = entry[0] || '';
+    message = entry.length > 1 ? entry[1] : '';
+  } else if (entry && typeof entry === 'object') {
+    message = entry.message || entry.msg || '';
+    ts = entry.ts || entry.timestamp || entry.date || '';
+  } else if (entry != null) {
+    message = String(entry);
+  }
+  const upper = String(message || '').toUpperCase();
+  if (!upper.startsWith('[PROGRESS]')) return null;
+  return [ts || 'unknown', stripLogPrefix(message)];
+}
+
+async function fetchProgressEntriesFromLog(instanceId) {
+  if (!instanceId || !LOG_SERVICE_BASE) return [];
+  const base = LOG_SERVICE_BASE.replace(/\/$/, '');
+  const target = `${base}/api/log/progress-all?instance_id=${encodeURIComponent(instanceId)}`;
+  try {
+    const response = await fetch(target);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const payload = await response.json();
+    const entries = Array.isArray(payload && payload.progress) ? payload.progress : [];
+    return entries.map(normalizeLogProgress).filter(Boolean);
+  } catch (error) {
+    const msg = error && error.message ? error.message : String(error);
+    console.warn(`[progress] Failed to fetch log entries for ${instanceId}: ${msg}`);
+    return [];
+  }
+}
+
+function readLegacyProgress(metaPath) {
+  if (!metaPath) return [];
+  const meta = readMeta(metaPath);
+  if (meta && Array.isArray(meta.progress)) {
+    return meta.progress;
+  }
+  return [];
+}
+
+async function handleEmailAgentProgressRequest(parsed, res) {
+  const instanceId = parsed.query && parsed.query.instance_id;
+  if (!instanceId) {
+    res.writeHead(400, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: 'missing_instance_id' }));
+    return;
+  }
+  const baseFolder = process.env.AGENT_FOLDER;
+  if (!baseFolder) {
+    res.writeHead(400, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: 'missing_env_AGENT_FOLDER' }));
+    return;
+  }
+  const instancePath = path.join(baseFolder, instanceId);
+  const metaPath = path.join(instancePath, 'meta.json');
+  let progressEntries = await fetchProgressEntriesFromLog(instanceId);
+  if (!progressEntries.length) {
+    progressEntries = readLegacyProgress(metaPath);
+  }
+  if (!progressEntries.length) {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ instance_id: instanceId, latest: null }));
+    return;
+  }
+  const latest = progressEntries[progressEntries.length - 1];
+  res.writeHead(200, { 'content-type': 'application/json' });
+  res.end(JSON.stringify({ instance_id: instanceId, latest }));
 }
 
 function isMetaStatus(metaPath, status) {
@@ -97,6 +181,9 @@ const fetch = require('node-fetch');
 const { generateHtml } = require('./llm');
 const { sendEmail } = require('./gmail');
 const { agent_log, appendLogLocal } = require('./logger');
+
+const LOG_API_URL = process.env.LOG_API_URL || 'http://localhost:4000/api/log';
+const LOG_SERVICE_BASE = LOG_API_URL.replace(/\/api\/log\/?$/, '');
 
 const SUMMARY_API_FALLBACK = 'http://127.0.0.1:5000';
 
@@ -439,6 +526,44 @@ function getHitlApiUrl() {
   return u;
 }
 
+function getAmpBackendUrl() {
+  return process.env.AMP_BACKEND_URL || 'http://127.0.0.1:5000';
+}
+
+async function resolveOrgIdForUsername(username) {
+  const normalized = (username || '').trim();
+  if (!normalized) return null;
+  const url = `${getAmpBackendUrl().replace(/\/$/, '')}/api/internal/users/resolve`;
+  const headers = { 'Content-Type': 'application/json' };
+  const internalSecret = process.env.AMP_INTERNAL_SECRET || process.env.AMP_TRIGGER_SECRET;
+  if (internalSecret) headers['X-AMP-Internal-Key'] = internalSecret;
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ username: normalized })
+    });
+    if (!res.ok) return null;
+    const data = await res.json().catch(() => null);
+    return data && data.org_id ? String(data.org_id) : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function resolveUsernameFromCtx(ctx) {
+  const metaPath = ctx && ctx.paths ? path.join(ctx.paths.root, 'meta.json') : null;
+  if (!metaPath) return '';
+  try {
+    if (!fs.existsSync(metaPath)) return '';
+    const raw = fs.readFileSync(metaPath, 'utf8');
+    const meta = JSON.parse(raw);
+    return (meta && meta.owner) ? String(meta.owner).trim() : '';
+  } catch (_) {
+    return '';
+  }
+}
+
 function getHitlConfig(base) {
   const a = base && base['human-in-the-loop'];
   const b = base && base['HITL'];
@@ -455,9 +580,15 @@ function getHitlConfig(base) {
 async function callHitlAgent({ instanceId, htmlPath, html, ctx, base, loopIndex }) {
   const url = getHitlApiUrl();
   const hitlCfg = getHitlConfig(base);
+  const username = resolveUsernameFromCtx(ctx);
+  const orgId = await resolveOrgIdForUsername(username);
+  if (!orgId) {
+    return { error: 'missing_org_id' };
+  }
   console.log('[DEBUG] HITL config from instance:', JSON.stringify(hitlCfg, null, 2));
   const payload = { 
-    caller_id: instanceId, 
+    caller_id: instanceId,
+    org_id: orgId,
     html_path: htmlPath, 
     html, 
     hitl: hitlCfg, 
@@ -1458,31 +1589,14 @@ const server = http.createServer(async (req, res) => {
 
   // Progress endpoint: returns only the latest progress entry for an instance
   if (method === 'GET' && parsed.pathname === '/api/email-agent/progress') {
-    const instanceId = parsed.query && parsed.query.instance_id;
-    if (!instanceId) {
-      res.writeHead(400, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ error: 'missing_instance_id' }));
-      return;
-    }
-    const baseFolder = process.env.AGENT_FOLDER;
-    if (!baseFolder) {
-      res.writeHead(400, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ error: 'missing_env_AGENT_FOLDER' }));
-      return;
-    }
-    const instancePath = path.join(baseFolder, instanceId);
-    const metaPath = path.join(instancePath, 'meta.json');
-    try {
-      const raw = fs.readFileSync(metaPath, 'utf8');
-      const meta = JSON.parse(raw);
-      const progress = Array.isArray(meta.progress) ? meta.progress : [];
-      const latest = progress.length ? progress[progress.length - 1] : null;
-      res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ instance_id: instanceId, latest }));
-    } catch (e) {
-      res.writeHead(404, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ error: `meta_not_found_or_invalid: ${e.message}` }));
-    }
+    handleEmailAgentProgressRequest(parsed, res).catch((err) => {
+      const message = err && err.message ? err.message : String(err);
+      console.error('[progress] Unexpected error:', message);
+      if (!res.writableEnded) {
+        res.writeHead(500, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'progress_handler_failed', detail: message }));
+      }
+    });
     return;
   }
 
