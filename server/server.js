@@ -486,8 +486,39 @@ function absoluteFromMaybeInstance(relOrAbs, ctx) {
   return ctx.paths ? path.join(ctx.paths.root, relOrAbs) : path.join(REPO_ROOT, relOrAbs);
 }
 
-function appendLlmTrace(rootPath, entry, runLogPath) {
+// Writes an LLM trace entry through AMP's llm_trace API instead of the
+// filesystem directly, so amp-backend is the single writer of llm_traces.json
+// (consistent path resolution with the GET reader used by the "click LLM"
+// log panel). Returns true only on a confirmed 2xx response.
+// Uses this agent's own identity-bound X-API-Key (AMP_API_KEY), not the
+// shared X-AMP-Internal-Key -- this is an external agent product, and
+// org_id must be derived from a real per-caller credential on the backend,
+// not self-asserted. Requires AMP_API_KEY to be configured (generate one
+// via AMP's Settings -> API Keys page); without it, trace writes fall back
+// to the local filesystem below rather than being silently dropped.
+async function postLlmTrace(rootPath, entry) {
+  const apiKey = process.env.AMP_API_KEY;
+  const instanceId = rootPath ? path.basename(rootPath) : '';
+  if (!instanceId || !apiKey) return false;
+  try {
+    const url = `${getAmpBackendUrl().replace(/\/$/, '')}/api/agents/${encodeURIComponent(instanceId)}/llm_trace`;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-API-Key': apiKey },
+      body: JSON.stringify(entry),
+    });
+    return res.ok;
+  } catch (_) {
+    return false;
+  }
+}
+
+async function appendLlmTrace(rootPath, entry, runLogPath) {
   if (!rootPath || !entry) return;
+  if (await postLlmTrace(rootPath, entry)) return;
+  // Fall back to the direct filesystem write (previous behavior) if the API
+  // call didn't succeed -- e.g. backend not yet deployed with this endpoint,
+  // or a network hiccup -- so a trace is never silently lost.
   try {
     const tracePath = path.join(rootPath, 'llm_traces.json');
     let records = [];
@@ -706,7 +737,7 @@ async function generateEmailFlow(body, ctxMaybe) {
     }
   }
   if (ctx.paths && reasoning) {
-    appendLlmTrace(ctx.paths.root, {
+    await appendLlmTrace(ctx.paths.root, {
       call_time: new Date().toISOString(),
       model: llmModelUsed || model,
       prompt: llmPromptUsed || prep.prompt,
